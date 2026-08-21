@@ -538,9 +538,9 @@ def plot_global_fit(result: dict, show: bool = True):
 
     for ds, c in zip(dsets, colors):
         tau_ms = ds["tau"] * 1e3
-        ax.semilogx(tau_ms, ds["G"], linestyle="none", marker=".",
-                    markersize=3.5, color=c, alpha=0.8,
-                    label=f"_{ds['name']}  (data)")
+        ln_data, = ax.semilogx(tau_ms, ds["G"], linestyle="none", marker=".",
+                               markersize=3.5, color=c, alpha=0.8,
+                               label=f"_{ds['name']}  (data)")
         # A rebuilt fit supplies its own curve (see rebuild_plot): the model
         # function may be unavailable, or re-evaluating it may not reproduce
         # what was actually fitted.  A live fit has no "dense" key and the
@@ -553,8 +553,13 @@ def plot_global_fit(result: dict, show: bool = True):
                                   np.log10(ds["tau"].max()), 400)
             g_dense = model.func(
                 t_dense, **{n: ds["values"][n] for n in result["names"]})
-        ax.semilogx(t_dense * 1e3, g_dense, color=c, linewidth=1.4,
-                    label=ds["name"])
+        ln_fit, = ax.semilogx(t_dense * 1e3, g_dense, color=c, linewidth=1.4,
+                              label=ds["name"])
+        # Pairing for the plot-tools Normalize toggle: the data points scale
+        # by the FIT's leading-point reference (the smooth model amplitude at
+        # tau_min), never by their own noisy first points — and never
+        # separately from the curve they were fitted with.
+        ln_data._norm_ref = ln_fit
         res = ds["resid"] / ds["sigma"] if result["weighted"] else ds["resid"]
         axr.semilogx(tau_ms, res, linestyle="none", marker=".",
                      markersize=2.5, color=c, alpha=0.8,

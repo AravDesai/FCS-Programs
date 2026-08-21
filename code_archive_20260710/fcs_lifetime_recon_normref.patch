@@ -1,0 +1,33 @@
+--- a/fcs_lifetime_recon.py
++++ b/fcs_lifetime_recon.py
+@@ -433,15 +433,25 @@
+     )
+ 
+     # Data
+-    ax.plot(t, y, linestyle="none", marker=".", markersize=2.5,
+-            color="black", alpha=0.8, label="decay")
++    ln_data, = ax.plot(t, y, linestyle="none", marker=".", markersize=2.5,
++                       color="black", alpha=0.8, label="decay")
+     # IRF, scaled to the decay peak for visual comparison
++    ln_irf = None
+     if result["has_irf"] and np.nanmax(irf) > 0:
+         irf_scaled = irf * (np.nanmax(y) / np.nanmax(irf))
+-        ax.plot(t, irf_scaled, color="0.6", linewidth=1.0,
+-                label="IRF (scaled)", zorder=1)
++        ln_irf, = ax.plot(t, irf_scaled, color="0.6", linewidth=1.0,
++                          label="IRF (scaled)", zorder=1)
+     # Fit
+-    ax.plot(t, yfit, color="tomato", linewidth=1.6, label="fit")
++    ln_fit, = ax.plot(t, yfit, color="tomato", linewidth=1.6, label="fit")
++    # Pairing for the plot-tools Normalize toggle: the decay scales by the
++    # fit's leading-point reference, never separately from its fit.  The IRF
++    # trace joins the pair as well — its own leading points are pre-rise
++    # baseline (near zero), so self-normalization would either blow it up or
++    # trip the zero-reference warning, and scaling it with the fit preserves
++    # the peak-matched visual comparison the trace exists for.
++    ln_data._norm_ref = ln_fit
++    if ln_irf is not None:
++        ln_irf._norm_ref = ln_fit
+ 
+     ax.set_yscale("log")
+     nz = y[y > 0]

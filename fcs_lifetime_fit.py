@@ -740,12 +740,16 @@ def plot_lifetime_fit(
     )
 
     # Data + smooth fit curve (log-y)
-    ax.semilogy(t_ns, np.maximum(result["counts"], 0.1), linestyle="none",
-                marker=".", markersize=3, color="black", label="data")
+    ln_data, = ax.semilogy(t_ns, np.maximum(result["counts"], 0.1),
+                           linestyle="none", marker=".", markersize=3,
+                           color="black", label="data")
     t_dense_rel = np.linspace(t_rel.min(), t_rel.max(), 600)
     y_dense = model.func(t_dense_rel, **{n: result["values"][n] for n in result["names"]})
-    ax.semilogy(t_dense_rel + t_ns[0], np.maximum(y_dense, 0.1),
-                color="tomato", linewidth=1.6, label="fit")
+    ln_fit, = ax.semilogy(t_dense_rel + t_ns[0], np.maximum(y_dense, 0.1),
+                          color="tomato", linewidth=1.6, label="fit")
+    # Pairing for the plot-tools Normalize toggle: data scale by the fit's
+    # leading-point reference, never separately from their fit.
+    ln_data._norm_ref = ln_fit
     ax.set_ylabel("Photon counts", fontsize=12)
 
     # Parameter summary box
@@ -1776,10 +1780,14 @@ def plot_lifetime_global_fit(result: dict, show: bool = True):
         2, 1, sharex=True, figsize=(9, 5.5),
         gridspec_kw={"height_ratios": [3, 1]}, layout="constrained")
     for d, colour in zip(dsets, colours):
-        ax.plot(d["x"], np.maximum(d["y"], 0.5), linestyle="none", marker=".",
-                markersize=2.5, color=colour, alpha=0.6, label=d["name"])
-        ax.plot(d["x"], np.maximum(d["yfit"], 0.5), "-", color=colour,
-                linewidth=1.4)
+        ln_data, = ax.plot(d["x"], np.maximum(d["y"], 0.5), linestyle="none",
+                           marker=".", markersize=2.5, color=colour,
+                           alpha=0.6, label=d["name"])
+        ln_fit, = ax.plot(d["x"], np.maximum(d["yfit"], 0.5), "-",
+                          color=colour, linewidth=1.4)
+        # Pairing for the plot-tools Normalize toggle: data scale by the
+        # fit's leading-point reference, never separately from their fit.
+        ln_data._norm_ref = ln_fit
         sig = d["sigma"] if d.get("sigma") is not None else 1.0
         axr.plot(d["x"], d["resid"] / sig, linestyle="none", marker=".",
                  markersize=2, color=colour)

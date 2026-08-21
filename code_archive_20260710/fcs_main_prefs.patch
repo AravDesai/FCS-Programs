@@ -1,0 +1,42 @@
+--- a/fcs_main.py
++++ b/fcs_main.py
+@@ -29,6 +29,19 @@
+ import fcs_calib
+ import fcs_plotopen
+ 
++# Preferences are optional: the suite runs unchanged without fcs_prefs.py,
++# every module keeping its built-in default constants.
++try:
++    import fcs_prefs
++except ImportError:
++    fcs_prefs = None
++
++if fcs_prefs is not None:
++    # Must run AFTER the suite imports above — apply() only reaches modules
++    # already in sys.modules (fcs_plottools, for instance, arrives
++    # transitively through fcs_fit).
++    fcs_prefs.apply()
++
+ 
+ # ── Global workspace state ────────────────────────────────────────────────────
+ 
+@@ -751,6 +764,19 @@
+ root.minsize(520, 400)
+ root.resizable(True, True)
+ 
++# ── Menu bar ──────────────────────────────────────────────────────────────────
++# Only built when fcs_prefs is present: Preferences is currently its sole
++# entry, and an empty Settings menu would be clutter.  Further menus can
++# hang off _menubar as they arrive.
++if fcs_prefs is not None:
++    _menubar = tk.Menu(root)
++    _settings_menu = tk.Menu(_menubar, tearoff=0)
++    _settings_menu.add_command(
++        label="Preferences…",
++        command=lambda: fcs_prefs.run_preferences_dialog(root))
++    _menubar.add_cascade(label="Settings", menu=_settings_menu)
++    root.config(menu=_menubar)
++
+ # Global toggle: when checked, each analysis also writes its plotted data
+ # to a CSV in an 'analysis' folder beside the source file.
+ #

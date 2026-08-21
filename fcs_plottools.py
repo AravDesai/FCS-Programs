@@ -1186,11 +1186,19 @@ def _build_legend_section(
     """
     Add the "Legend" LabelFrame to *panel*, if the main axis has a legend.
 
-    Offers three controls:
+    Offers these controls:
       * Show legend — a checkbox to hide/show it (useful when an overlay of
         many datasets produces an enormous legend).
       * Position — dropdown to move it.
       * Text size — slider to shrink or grow it.
+      * Entries — a per-entry list with a legend-only display text and an
+        include/exclude toggle.  Both are keyed by id(handle) and live only
+        in this closure: nothing here calls set_label(), so the Traces
+        section, exports, and any later analysis see the original names
+        unchanged, and an excluded entry's trace stays visible on the plot.
+        Exclusion is reversible (re-tick "Show in legend"); clearing the
+        text reverts to the entry's own label.  Neither survives the
+        session — reopening the figure via fcs_plotopen starts clean.
 
     Position and size changes rebuild the legend from a snapshot of its
     HANDLES captured when the panel is built; the snapshot is taken from the
@@ -1239,6 +1247,42 @@ def _build_legend_section(
     if not handles:
         handles, labels = ax.get_legend_handles_labels()
 
+    # ── Resolve display copies back to the axes artists ───────────────────────
+    # On matplotlib >= 3.7 (observed on 3.10) legend_handles holds the
+    # handler-created DISPLAY artists, not the originals, so matching them
+    # against the axes by identity fails and every labelled trace appears
+    # twice on rebuild: once from the snapshot and once from the axes scan.
+    # The copies inherit the original artist's label (even when the legend
+    # was created with different display text), so an id miss is resolved by
+    # label instead.  With duplicate labels the first artist wins — the same
+    # ambiguity ax.legend() itself has.  A handle matching nothing (a true
+    # proxy such as the intensity plot's mean-CPS Patch, whose copy carries
+    # "_nolegend_") is kept as-is.
+    _axes_arts = []
+    for _ax in axes_list:
+        _axes_arts.extend(_ax.get_lines())
+        _axes_arts.extend(getattr(_ax, "collections", []))
+    _art_ids  = {id(_a) for _a in _axes_arts}
+    _by_label = {}
+    for _a in _axes_arts:
+        try:
+            _l = _a.get_label() or ""
+        except Exception:
+            continue
+        if _l and not _l.startswith("_"):
+            _by_label.setdefault(_l, _a)
+
+    def _canonical(h):
+        if id(h) in _art_ids:
+            return h
+        try:
+            _l = h.get_label() or ""
+        except Exception:
+            return h
+        return _by_label.get(_l, h)
+
+    handles = [_canonical(h) for h in handles]
+
     title_artist = leg.get_title()
     title_text   = title_artist.get_text() if title_artist is not None else ""
     title_text   = title_text or None
@@ -1284,9 +1328,18 @@ def _build_legend_section(
     lf = tk.LabelFrame(panel, text="Legend", padx=10, pady=6)
     lf.pack(fill="x", padx=10, pady=4)
 
-    def _live_entries():
+    # Per-entry legend edits, keyed by id(handle).  Legend-only by design:
+    # an override never touches the artist's label, and exclusion never
+    # touches the artist's visibility.  Session-only: neither is exported.
+    excluded  = set()   # ids of handles dropped from the legend
+    overrides = {}      # id(handle) -> display text for the legend
+
+    def _candidate_entries():
         """
-        Current (handles, labels) for the legend.
+        Every (handle, label) that COULD appear in the legend right now,
+        with display-text overrides applied but exclusions NOT yet filtered
+        out — the Entries list must show excluded entries too, or there
+        would be no way to bring one back.
 
         Built from the snapshot first, so proxy artists keep their original
         order and survive, then extended with any axes artist that has since
@@ -1294,7 +1347,7 @@ def _build_legend_section(
         the snapshot text is only a fallback for proxies whose label was set
         on the legend rather than on the handle.
         """
-        out_h, out_l, seen = [], [], set()
+        out, seen = [], set()
         snap = list(zip(handles, labels)) if len(handles) == len(labels) \
             else [(h, "") for h in handles]
         for h, snap_lbl in snap:
@@ -1312,8 +1365,7 @@ def _build_legend_section(
                 lbl = snap_lbl
             if not lbl or lbl.startswith("_"):
                 continue
-            out_h.append(h)
-            out_l.append(lbl)
+            out.append((h, overrides.get(id(h), lbl)))
 
         for _ax in axes_list:
             arts = list(_ax.get_lines()) + list(getattr(_ax, "collections", []))
@@ -1327,14 +1379,33 @@ def _build_legend_section(
                 except Exception:
                     continue
                 if lbl and not lbl.startswith("_"):
-                    out_h.append(art)
-                    out_l.append(lbl)
-        return out_h, out_l
+                    out.append((art, overrides.get(id(art), lbl)))
+        return out
+
+    def _live_entries():
+        """Current (handles, labels) for the legend: candidates minus
+        excluded entries."""
+        pairs = [(h, l) for h, l in _candidate_entries()
+                 if id(h) not in excluded]
+        return [h for h, _ in pairs], [l for _, l in pairs]
+
+    # The Entries list is built further down (widgets pack in code order, and
+    # it sits below the existing controls), but _apply_legend must refresh it
+    # so edits made in the Traces section show up there too; resolved lazily
+    # through this holder, same pattern as _legend_cb in build_plot_controls.
+    _entries_ui = {"refresh": None}
+
+    def _refresh_entries_list():
+        fn = _entries_ui["refresh"]
+        if fn is not None:
+            fn()
 
     def _apply_legend(*_):
+        _refresh_entries_list()
         live_h, live_l = _live_entries()
         if not live_h:
-            # Everything hidden: drop the legend rather than draw an empty box.
+            # Everything hidden or excluded: drop the legend rather than
+            # draw an empty box.
             existing = ax.get_legend()
             if existing is not None:
                 existing.set_visible(False)
@@ -1393,6 +1464,142 @@ def _build_legend_section(
         variable=size_var, command=_apply_legend,
         showvalue=True, length=130, font=("Helvetica", 8),
     ).pack(side="left", padx=4, fill="x", expand=True)
+
+    # ── Entries ───────────────────────────────────────────────────────────────
+    # Layout mirrors the Traces section: a selector plus ONE control block
+    # that retargets to whichever entry is selected.  Inclusion is shown in
+    # the list itself (● in legend, ○ excluded) so the state of every entry
+    # is readable at a glance.
+    tk.Label(lf, text="Entries:", anchor="w",
+             font=("Helvetica", 9)).pack(fill="x", pady=(8, 0))
+
+    ent_row = tk.Frame(lf)
+    ent_row.pack(fill="x")
+    ent_sb = tk.Scrollbar(ent_row, orient="vertical")
+    ent_lb = tk.Listbox(
+        ent_row, height=min(6, max(3, _n_entries)), activestyle="none",
+        font=("Courier", 9), exportselection=False,
+        yscrollcommand=ent_sb.set,
+    )
+    ent_sb.config(command=ent_lb.yview)
+    ent_sb.pack(side="right", fill="y")
+    ent_lb.pack(side="left", fill="both", expand=True)
+
+    # Handle of each listbox row, parallel to the rows themselves.  Rebuilt
+    # on every refresh; handles are compared by id(), never held past it.
+    ent_rows = []
+
+    # True while the control block is being repopulated from a newly selected
+    # entry, so the apply callbacks do not fire and write the previous
+    # entry's settings onto the new one (same guard as the Traces section).
+    ent_loading = {"busy": False}
+
+    inc_var  = tk.BooleanVar(master=panel, value=True)
+    text_var = tk.StringVar(master=panel, value="")
+
+    def _ent_row_text(h, lbl) -> str:
+        dot = _DOT_HIDDEN if id(h) in excluded else _DOT_SHOWN
+        return f"{dot} {lbl}"
+
+    def _refresh_entries():
+        """
+        Repopulate the listbox from the current candidates, preserving the
+        selection by handle identity — the selected entry may have moved
+        rows if a trace was hidden or renamed in the Traces section.
+        """
+        sel_id = None
+        sel = ent_lb.curselection()
+        if sel and sel[0] < len(ent_rows):
+            sel_id = id(ent_rows[sel[0]])
+
+        ent_loading["busy"] = True
+        try:
+            ent_lb.delete(0, "end")
+            ent_rows.clear()
+            for h, lbl in _candidate_entries():
+                ent_rows.append(h)
+                ent_lb.insert("end", _ent_row_text(h, lbl))
+                if id(h) == sel_id:
+                    ent_lb.selection_set(len(ent_rows) - 1)
+        finally:
+            ent_loading["busy"] = False
+
+    _entries_ui["refresh"] = _refresh_entries
+
+    def _ent_selected():
+        sel = ent_lb.curselection()
+        return ent_rows[sel[0]] if sel and sel[0] < len(ent_rows) else None
+
+    def _on_entry_select(_event=None):
+        h = _ent_selected()
+        if h is None:
+            return
+        ent_loading["busy"] = True
+        try:
+            inc_var.set(id(h) not in excluded)
+            cur = dict((id(ch), l) for ch, l in _candidate_entries())
+            text_var.set(cur.get(id(h), ""))
+        finally:
+            ent_loading["busy"] = False
+
+    ent_lb.bind("<<ListboxSelect>>", _on_entry_select)
+
+    inc_cb = tk.Checkbutton(
+        lf, text="Show in legend", variable=inc_var, anchor="w",
+        font=("Helvetica", 9),
+    )
+    inc_cb.pack(fill="x", pady=(4, 0))
+
+    def _apply_include(*_):
+        if ent_loading["busy"]:
+            return
+        h = _ent_selected()
+        if h is None:
+            return
+        if inc_var.get():
+            excluded.discard(id(h))
+        else:
+            excluded.add(id(h))
+        _apply_legend()
+
+    inc_cb.config(command=_apply_include)
+
+    txt_row = tk.Frame(lf)
+    txt_row.pack(fill="x", pady=(2, 0))
+    tk.Label(txt_row, text="Text:", width=7, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    txt_entry = tk.Entry(txt_row, textvariable=text_var,
+                         font=("Helvetica", 9))
+    txt_entry.pack(side="left", padx=4, fill="x", expand=True)
+    tk.Label(
+        lf,
+        text="      legend only — the trace keeps its own name;\n"
+             "      clear the text to revert",
+        font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+    ).pack(fill="x")
+
+    def _apply_text(_event=None):
+        if ent_loading["busy"]:
+            return
+        h = _ent_selected()
+        if h is None:
+            return
+        new_text = text_var.get().strip()
+        if new_text:
+            overrides[id(h)] = new_text
+        else:
+            # Empty text reverts to the entry's own label rather than
+            # producing a blank legend row.
+            overrides.pop(id(h), None)
+        _apply_legend()
+        # Rewriting the listbox row moves the reverted label back into the
+        # text field so the control shows what the legend now shows.
+        _on_entry_select()
+
+    txt_entry.bind("<Return>", _apply_text)
+    txt_entry.bind("<FocusOut>", _apply_text)
+
+    _refresh_entries()
 
     loc_var.trace_add("write", _apply_legend)
 
