@@ -76,12 +76,52 @@ def palette(n: int) -> list:
     return [cmap(x) for x in np.linspace(0.05, 0.95, n)]
 
 
+# Longest figure name carried into a window title.  Beyond this the title
+# bar truncates anyway, and on Windows an over-long title squeezes out the
+# figure number -- the one part that has to stay readable, since it is what
+# ties a panel to its figure when two titles are near-identical.
+_TITLE_MAX_CHARS = 44
+
+
+def _figure_name(fig, axes_list) -> str:
+    """
+    A short human name for *fig*, taken from its main axes title.
+
+    Producers already title every figure ("Lifetime global fit — 2-exp
+    · 5 datasets", "PCH global fit — ...").  Reading that title here keeps
+    the naming automatic: no producer passes a name, and a new plotting
+    routine is named correctly the day it is written.
+
+    Titles are frequently two-line (``f"{title}\\n{subtitle}"``), so only
+    the first line is used, collapsed and truncated.  Returns "" when the
+    figure has no title, in which case callers fall back to the bare
+    figure number.
+    """
+    try:
+        raw = (axes_list[0].get_title() or "").strip()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    first = raw.splitlines()[0]
+    first = " ".join(first.split())          # collapse runs of whitespace
+    if len(first) > _TITLE_MAX_CHARS:
+        first = first[:_TITLE_MAX_CHARS - 1].rstrip() + "…"
+    return first
+
+
 def show_figure(
     fig: plt.Figure,
     axes=None,
 ) -> None:
     """
     Display *fig* and attach a live-edit controls panel beside it.
+
+    The figure window and its panel are named after the figure's own title
+    and share its number ("Figure 3 — Lifetime global fit", "Plot controls
+    — Figure 3 — Lifetime global fit"), and the panel is marked transient
+    for the figure window, so with several figures open it is always
+    apparent which panel drives which figure.
 
     Parameters
     ----------
@@ -116,10 +156,37 @@ def show_figure(
 
     import tkinter as tk
 
+    # ── Name both windows after the figure ────────────────────────────────
+    # Default titles are matplotlib's "Figure 1/2/3..." against a generic
+    # "Plot controls", which leaves nothing on screen connecting a panel to
+    # its figure once more than one is open.  Both now carry the figure
+    # number and its title, so the pairing is readable at a glance and in
+    # the taskbar.
+    _fig_no = getattr(fig, "number", None)
+    _stem = f"Figure {_fig_no}" if _fig_no is not None else "Figure"
+    _name = _figure_name(fig, axes_list)
+    _label = f"{_stem} — {_name}" if _name else _stem
+    try:
+        fig.canvas.manager.set_window_title(_label)
+    except Exception:
+        pass          # non-Tk manager, or one without a settable title
+
     # ── Build the controls panel ──────────────────────────────────────────
     panel = tk.Toplevel(tk_win)
-    panel.title("Plot controls")
+    panel.title(f"Plot controls — {_label}")
     panel.resizable(False, True)
+
+    # Tie the panel to its figure at the window-manager level.  A transient
+    # window stays above its master, minimises and restores with it, and
+    # drops its own taskbar button -- so a panel can never be buried under
+    # an unrelated figure, and minimising a figure no longer leaves an
+    # orphaned panel behind.  Guarded: on some non-Windows managers
+    # transient windows lose their minimise control, and a failure here
+    # must not cost the panel itself.
+    try:
+        panel.transient(tk_win)
+    except Exception:
+        pass
 
     # The sections stack to well over a laptop screen's height once Traces is
     # added, so they live in a scrollable body rather than directly on the
