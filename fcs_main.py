@@ -966,7 +966,11 @@ def task_model():
     # Pass the workspace file order so global-fit datasets/rows follow it
     # instead of being listed alphabetically.
     order = [fd.filepath.name for fd in workspace.values()]
-    fcs_fit.run_model_dialog(d, parent=root, workspace_order=order)
+    # The current multi-selection rides along too: with several photon files
+    # selected, the lifetime fitter offers a global fit across them directly,
+    # without a detour through exported decay CSVs.
+    fcs_fit.run_model_dialog(d, parent=root, workspace_order=order,
+                             selected=_selected_datasets())
 
 
 def task_calibrate():

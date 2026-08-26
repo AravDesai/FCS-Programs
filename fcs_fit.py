@@ -1320,7 +1320,8 @@ def export_global_fit(result: dict, out_source: str | Path,
 
 # ── GUI workflow ──────────────────────────────────────────────────────────────
 
-def run_model_dialog(fcs_data=None, parent=None, workspace_order=None):
+def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
+                     selected=None):
     """
     Top-level entry: choose which data type to model, then dispatch.
 
@@ -1340,6 +1341,10 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None):
     ``workspace_order`` is an optional list of source .fcs file names in
     workspace order; when given, discovered correlation datasets are listed
     and reported in that order instead of alphabetically.
+
+    ``selected`` is the list of FCSData objects currently multi-selected in
+    the main-window workspace.  It is forwarded to the lifetime fitter,
+    which offers a global fit across the selected photon files directly.
     """
     import tkinter as tk
 
@@ -1372,7 +1377,8 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None):
         # The tail-vs-reconvolution choice comes AFTER this one: asking how to
         # fit a lifetime before the user has said they want a lifetime fit puts
         # the questions in the wrong order.
-        fcs_lifetime_fit.run_lifetime_method_dialog(fcs_data, parent=parent)
+        fcs_lifetime_fit.run_lifetime_method_dialog(fcs_data, parent=parent,
+                                                    selected=selected)
 
     def _pch():
         win.destroy()

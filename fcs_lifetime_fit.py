@@ -1065,7 +1065,8 @@ def _move_gate_line(which: str, x: float, lo: float, hi: float,
     return lo, max(x, lo + min_sep)
 
 
-def _lifetime_window_dialog(parent, datasets: list, on_done):
+def _lifetime_window_dialog(parent, datasets: list, on_done, on_back=None,
+                            initial_windows=None):
     """
     Screen — the fit window.
 
@@ -1080,6 +1081,12 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
     numbers, press a button, judge a separate figure, close it, try again --
     makes you carry the picture in your head between steps and leaves a trail
     of throwaway figures.
+
+    *initial_windows* (a list of (lo, hi), one per dataset) seeds the dialog
+    when the flow returns here via Back: identical pairs seed the shared
+    gate; differing pairs additionally seed and reveal the per-dataset table.
+    Lengths that do not match *datasets* are ignored — the selection may
+    have changed on the way back through the picker.
 
     Calls ``on_done(datasets, windows)``: the datasets may have been re-binned
     or had their channel changed on the way through, so they come back rather
@@ -1106,11 +1113,20 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
             ds["name"] = f"{base}[{ds['series']}]"
             on_done([ds], [(float(fit_start), float(fit_end))])
 
-        _lifetime_data_dialog(parent, ds["decay"], _got)
+        _lifetime_data_dialog(parent, ds["decay"], _got, on_back=on_back)
         return
 
     # ── Several datasets: interactive overlay ────────────────────────────────
     start0, end0 = default_window_for(datasets)
+    seed_per = None
+    if initial_windows is not None and len(initial_windows) == D:
+        # Returning via Back: reopen with the windows chosen last time
+        # instead of the recomputed default.
+        if all(w == initial_windows[0] for w in initial_windows):
+            start0, end0 = float(initial_windows[0][0]), float(initial_windows[0][1])
+        else:
+            seed_per = [(float(a), float(b)) for a, b in initial_windows]
+            start0, end0 = seed_per[0]
     t_min = min(float(d["t_ns"][0]) for d in datasets)
     t_max = max(float(d["t_ns"][-1]) for d in datasets)
     period = max(float(d.get("laser_period_ns") or t_max) for d in datasets)
@@ -1234,8 +1250,12 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
     def _pick_one(ds, sv, ev):
         """Pick this dataset's window on its own histogram, interactively."""
         try:
+            # gate_n_bins is LoadedDecay's "what can I render" question; a
+            # photon-backed dataset (FCSData from the main-window selection)
+            # can render any resolution, so 512 stands as asked.
+            _gnb = getattr(ds["decay"], "gate_n_bins", None)
             gate = fcs_lifetime.select_gate(
-                ds["decay"], n_bins=ds["decay"].gate_n_bins(512),
+                ds["decay"], n_bins=(_gnb(512) if _gnb is not None else 512),
                 channels=(ds["channel"] or ds["decay"].channels[0],),
                 initial_gate=(float(sv.get()), float(ev.get())),
                 title=f"Fit window — {ds['name']}")
@@ -1249,8 +1269,9 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
     for r, ds in enumerate(datasets):
         tk.Label(per_frame, text=f"{r + 1}  {ds['name']}", anchor="w",
                  font=("Courier", 8), width=36).grid(row=r, column=0, sticky="w")
-        sv = tk.StringVar(value=f"{start0:.2f}")
-        ev = tk.StringVar(value=f"{end0:.2f}")
+        _s0, _e0 = seed_per[r] if seed_per is not None else (start0, end0)
+        sv = tk.StringVar(value=f"{_s0:.2f}")
+        ev = tk.StringVar(value=f"{_e0:.2f}")
         tk.Entry(per_frame, textvariable=sv, width=9).grid(row=r, column=1, padx=3)
         tk.Entry(per_frame, textvariable=ev, width=9).grid(row=r, column=2, padx=3)
         tk.Button(per_frame, text="Pick…", pady=1,
@@ -1272,6 +1293,12 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
                              "(for decays whose histogram phase differs)",
                    variable=per_var, command=_toggle_per,
                    anchor="w").pack(fill="x", padx=14)
+    if seed_per is not None:
+        # Returning via Back with per-dataset windows: show the table with
+        # the seeded values.  Deliberately NOT via _toggle_per, whose
+        # toggle-on copies the shared entries over every row.
+        per_var.set(True)
+        per_frame.pack(fill="x", padx=12, pady=(0, 4))
     tk.Label(win, text="Amplitudes are measured from the window start, so "
                        "per-dataset windows make A values incomparable between "
                        "datasets — lifetimes are unaffected.",
@@ -1319,6 +1346,14 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
         plt.close(fig)
         win.destroy()
 
+    def _back():
+        plt.close(fig)
+        win.destroy()
+        on_back()
+
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10, command=_back,
+                  pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Next →", width=12, command=_next,
               pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=_cancel,
@@ -1327,7 +1362,7 @@ def _lifetime_window_dialog(parent, datasets: list, on_done):
 
 
 def _lifetime_global_setup_dialog(parent, model: FCSModel, datasets: list,
-                                  windows: list):
+                                  windows: list, on_back=None):
     """Screen — per-parameter link / guess / bounds / fix / rule, then fit."""
     import tkinter as tk
     from tkinter import messagebox
@@ -1409,6 +1444,10 @@ def _lifetime_global_setup_dialog(parent, model: FCSModel, datasets: list,
             parent=parent)
         fcs_plottools.show_figure(fig)
 
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10, pady=4,
+                  command=lambda: (win.destroy(), on_back())
+                  ).pack(side="left", padx=6)
     tk.Button(btns, text="Fit", width=12, command=_do_fit,
               pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=win.destroy,
@@ -1807,7 +1846,8 @@ def plot_lifetime_global_fit(result: dict, show: bool = True):
     return fig, np.array([ax, axr])
 
 
-def run_lifetime_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
+def run_lifetime_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None,
+                            on_back=None, selected=None):
     """
     Full GUI flow for lifetime modelling: choose a source, then channel /
     resolution / window, pick a model, set guesses and bounds, then fit, plot
@@ -1821,38 +1861,138 @@ def run_lifetime_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
     photon data, because :class:`LoadedDecay` satisfies the same three
     attributes fcs_lifetime uses.  With no photon data loaded the chooser is
     bypassed straight to the CSV browser, since there is nothing else to fit.
-    """
-    def _run(source):
-        def _after_data(channel, n_bins, t_ns, counts, fit_start, fit_end):
-            def _after_model(model: FCSModel):
-                _lifetime_setup_dialog(parent, source, model, channel, n_bins,
-                                       t_ns, counts, fit_start, fit_end)
-            _select_lifetime_model_dialog(parent, _after_model)
-        _lifetime_data_dialog(parent, source, _after_data)
 
-    def _from_csv():
+    Every screen from the source chooser onward carries a Back button, so a
+    wrong choice costs one click instead of a cancel-and-restart.  Each
+    screen is a named constructor closure that Back re-invokes; selections
+    made on the way forward (channel, resolution, window, model, per-dataset
+    windows) are held in a flow-level ``state`` dict and seed the re-opened
+    screen.  The parameter table of the final setup screen is the one thing
+    NOT preserved across Back: its rows belong to the chosen model, so
+    revisiting the model screen invalidates them by construction.
+    """
+    def _run(source, back_to_source=None):
+        state: dict = {"channel": None, "n_bins": None, "model_key": None}
+
+        def _show_data():
+            _lifetime_data_dialog(parent, source, _after_data,
+                                  on_back=back_to_source,
+                                  initial_channel=state["channel"],
+                                  initial_bins=state["n_bins"])
+
+        def _after_data(channel, n_bins, t_ns, counts, fit_start, fit_end):
+            state["channel"], state["n_bins"] = channel, n_bins
+
+            def _show_model():
+                _select_lifetime_model_dialog(parent, _after_model,
+                                              on_back=_show_data,
+                                              initial_key=state["model_key"])
+
+            def _after_model(model: FCSModel):
+                state["model_key"] = model.key
+                _lifetime_setup_dialog(parent, source, model, channel, n_bins,
+                                       t_ns, counts, fit_start, fit_end,
+                                       on_back=_show_model)
+            _show_model()
+        _show_data()
+
+    def _from_csv(back_to_csv=None):
         # Saved decays always go through the multi-dataset path: with one
         # selected it IS the single fit, and adding a second is one click
         # rather than a different menu item.
-        def _after_datasets(datasets: list):
-            def _after_windows(chosen: list, windows: list):
-                def _after_model(model: FCSModel):
-                    _lifetime_global_setup_dialog(parent, model, chosen,
-                                                  windows)
-                _select_lifetime_model_dialog(parent, _after_model)
-            _lifetime_window_dialog(parent, datasets, _after_windows)
-        fcs_fitdialogs.select_datasets(
-            parent, lifetime_dataset_source(),
-            _default_decay_dir(fcs_data), _after_datasets)
+        state: dict = {"model_key": None, "windows": None}
 
-    if fcs_data is None:
+        def _show_select():
+            # select_datasets keeps its own session memory of the curated
+            # list, so re-entering it via Back is non-destructive.  It is
+            # also the flow's re-entry point: it has no Back of its own.
+            fcs_fitdialogs.select_datasets(
+                parent, lifetime_dataset_source(),
+                _default_decay_dir(fcs_data), _after_datasets)
+
+        def _after_datasets(datasets: list):
+            def _show_window():
+                _lifetime_window_dialog(parent, datasets, _after_windows,
+                                        on_back=_show_select,
+                                        initial_windows=state["windows"])
+
+            def _after_windows(chosen: list, windows: list):
+                state["windows"] = windows
+
+                def _show_model():
+                    _select_lifetime_model_dialog(
+                        parent, _after_model, on_back=_show_window,
+                        initial_key=state["model_key"])
+
+                def _after_model(model: FCSModel):
+                    state["model_key"] = model.key
+                    _lifetime_global_setup_dialog(parent, model, chosen,
+                                                  windows,
+                                                  on_back=_show_model)
+                _show_model()
+            _show_window()
+        _show_select()
+
+    def _run_multi(files, back_to_source=None):
+        """Global fit over the photon files selected in the main window."""
+        state: dict = {"mode": None, "n_bins": None,
+                       "model_key": None, "windows": None}
+
+        def _show_multi():
+            _lifetime_multi_data_dialog(parent, files, _after_multi,
+                                        on_back=back_to_source,
+                                        initial_mode=state["mode"],
+                                        initial_bins=state["n_bins"])
+
+        def _after_multi(datasets, mode, n_bins):
+            state["mode"], state["n_bins"] = mode, n_bins
+
+            def _show_window():
+                _lifetime_window_dialog(parent, datasets, _after_windows,
+                                        on_back=_show_multi,
+                                        initial_windows=state["windows"])
+
+            def _after_windows(chosen: list, windows: list):
+                state["windows"] = windows
+
+                def _show_model():
+                    _select_lifetime_model_dialog(
+                        parent, _after_model, on_back=_show_window,
+                        initial_key=state["model_key"])
+
+                def _after_model(model: FCSModel):
+                    state["model_key"] = model.key
+                    _lifetime_global_setup_dialog(parent, model, chosen,
+                                                  windows,
+                                                  on_back=_show_model)
+                _show_model()
+            _show_window()
+        _show_multi()
+
+    # Photon-record files from the main-window multi-selection.  Two or more
+    # make a direct global fit available; entries without arrival times
+    # (.ifx decays, loaded histograms) cannot be histogrammed here.
+    photon_sel = [d for d in (selected or [])
+                  if hasattr(d, "ch1_times_s")]
+
+    if fcs_data is None and len(photon_sel) < 2:
         _from_csv()
         return
-    _lifetime_source_dialog(parent, fcs_data,
-                            lambda: _run(fcs_data), _from_csv)
+
+    def _show_source():
+        _lifetime_source_dialog(
+            parent, fcs_data,
+            lambda: _run(fcs_data, back_to_source=_show_source),
+            lambda: _from_csv(back_to_csv=_show_source),
+            on_back=on_back,
+            on_selected=(lambda: _run_multi(photon_sel,
+                                            back_to_source=_show_source))
+            if len(photon_sel) >= 2 else None,
+            n_selected=len(photon_sel))
+    _show_source()
 
 
-def run_lifetime_method_dialog(data=None, parent=None):
+def run_lifetime_method_dialog(data=None, parent=None, selected=None):
     """
     Choose tail fit vs IRF reconvolution, then hand off to that fitter.
 
@@ -1907,7 +2047,12 @@ def run_lifetime_method_dialog(data=None, parent=None):
             import fcs_lifetime_recon
             fcs_lifetime_recon.run_reconv_fit_dialog(data, parent=parent)
         else:
-            run_lifetime_fit_dialog(data, parent=parent)
+            run_lifetime_fit_dialog(
+                data, parent=parent,
+                on_back=lambda: run_lifetime_method_dialog(data,
+                                                           parent=parent,
+                                                           selected=selected),
+                selected=selected)
 
     btns = tk.Frame(win)
     btns.pack(pady=10)
@@ -1918,8 +2063,10 @@ def run_lifetime_method_dialog(data=None, parent=None):
     win.wait_window()
 
 
-def _lifetime_source_dialog(parent, fcs_data, on_photons, on_csv):
-    """Screen 0 — fit the active file's photon records, or a saved decay."""
+def _lifetime_source_dialog(parent, fcs_data, on_photons, on_csv,
+                            on_back=None, on_selected=None, n_selected=0):
+    """Screen 0 — the active file's photon records, the files selected in
+    the main window (global fit), or a saved decay."""
     import tkinter as tk
 
     win = tk.Toplevel(parent)
@@ -1937,19 +2084,35 @@ def _lifetime_source_dialog(parent, fcs_data, on_photons, on_csv):
         win.destroy()
         fn()
 
-    tk.Button(body, text="Active file — photon records", width=32, pady=6,
-              command=lambda: _go(on_photons)).pack(pady=3)
-    tk.Label(body, text=f"{fcs_data.filepath.name}\n"
-                        f"any histogram resolution, binned now",
-             font=("Helvetica", 8), fg="grey", justify="center").pack()
+    if fcs_data is not None:
+        tk.Button(body, text="Active file — photon records", width=32, pady=6,
+                  command=lambda: _go(on_photons)).pack(pady=3)
+        tk.Label(body, text=f"{fcs_data.filepath.name}\n"
+                            f"any histogram resolution, binned now",
+                 font=("Helvetica", 8), fg="grey", justify="center").pack()
+
+    if on_selected is not None:
+        tk.Button(body, text=f"Selected files ({n_selected}) — global fit",
+                  width=32, pady=6,
+                  command=lambda: _go(on_selected)).pack(pady=(10, 3))
+        tk.Label(body, text="photon records of the files selected in the\n"
+                            "main window, histogrammed now and fitted "
+                            "together",
+                 font=("Helvetica", 8), fg="grey", justify="center").pack()
 
     tk.Button(body, text="Saved decay (CSV)…", width=32, pady=6,
               command=lambda: _go(on_csv)).pack(pady=(10, 3))
     tk.Label(body, text="resolution limited to exact rebins of the export",
              font=("Helvetica", 8), fg="grey").pack()
 
-    tk.Button(win, text="Cancel", width=10, command=win.destroy,
-              pady=4).pack(pady=10)
+    btns = tk.Frame(win)
+    btns.pack(pady=10)
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10,
+                  command=lambda: _go(on_back),
+                  pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
     win.wait_window()
 
 
@@ -2133,12 +2296,163 @@ def _lifetime_csv_dialog(parent, fcs_data, on_done):
     _populate()
     win.wait_window()
 
-def _lifetime_data_dialog(parent, fcs_data, on_done):
+def _photon_dataset(f, channel: int, n_bins: int) -> dict:
+    """
+    One global-fit dataset dict from a photon file's channel, in the same
+    shape :func:`lifetime_dataset_source` builds from a saved decay -- the
+    downstream screens (window overlay, global setup) see no difference.
+    The FCSData object itself rides along as ``decay``; it satisfies the
+    ``channels`` / ``lifetime_histogram`` interface those screens use, and
+    the one LoadedDecay-only method (``gate_n_bins``) is guarded at its
+    single call site.
+    """
+    t_ns, counts = f.lifetime_histogram(channel=channel, n_bins=n_bins)
+    return {
+        "name": f"{f.filepath.stem}[Ch{channel}]",
+        "path": f.filepath, "series": f"Ch{channel}", "channel": channel,
+        "decay": f, "t_ns": np.asarray(t_ns), "counts": np.asarray(counts),
+        "n_bins": int(n_bins),
+        "laser_period_ns": getattr(f, "laser_period_ns", None),
+        "origin": getattr(f, "source_name", None), "meta": {},
+    }
+
+
+def _lifetime_multi_data_dialog(parent, files, on_done, on_back=None,
+                                initial_mode=None, initial_bins=None):
+    """
+    Screen 1 (multi-file) — channel and resolution for a global fit over
+    the photon files selected in the main window.
+
+    One channel choice and one histogram resolution apply to every file:
+    the selection came from the workspace as a batch, and a global fit
+    compares like with like.  "Both channels" makes each recorded channel
+    of each file its own dataset -- the same one-row-per-channel convention
+    the saved-decay picker uses -- so, for instance, Ch1 and Ch2 lifetimes
+    can be linked across the whole selection.  A file lacking the chosen
+    channel is reported by name on Next, never silently dropped.
+
+    Windows are NOT chosen here: the next screen overlays every decay with
+    the shared draggable gate, exactly as the saved-decay path does.
+
+    *initial_mode* / *initial_bins* seed the controls when returning via
+    Back.
+
+    Calls ``on_done(datasets, mode, n_bins)``.
+    """
+    import tkinter as tk
+    from tkinter import messagebox
+
+    win = tk.Toplevel(parent)
+    win.title("Lifetime global fit — data")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text="Lifetime global fit — select data",
+             font=("Helvetica", 12, "bold"), pady=8).pack()
+    tk.Label(win, text=f"{len(files)} files selected in the main window",
+             font=("Helvetica", 9), fg="grey").pack()
+
+    lst = tk.LabelFrame(win, text="Files", padx=10, pady=4)
+    lst.pack(fill="x", padx=14, pady=(6, 4))
+    for f in files:
+        chs = ", ".join(f"Ch{c}" for c in getattr(f, "channels", (1, 2)))
+        tk.Label(lst, text=f"{f.filepath.name:<40s}  [{chs}]",
+                 font=("Courier", 8), anchor="w").pack(fill="x")
+
+    body = tk.Frame(win, padx=14, pady=4)
+    body.pack(fill="x")
+
+    mode_var = tk.StringVar(
+        value=str(initial_mode) if initial_mode in (1, 2, "both") else "1")
+    tk.Label(body, text="Channel:", anchor="w").grid(row=0, column=0,
+                                                     sticky="w", pady=3)
+    ch_frame = tk.Frame(body)
+    ch_frame.grid(row=0, column=1, sticky="w")
+    for text, val in (("Ch1", "1"), ("Ch2", "2"),
+                      ("Both channels", "both")):
+        tk.Radiobutton(ch_frame, text=text, variable=mode_var,
+                       value=val).pack(side="left")
+    tk.Label(body, text='      "Both" makes each recorded channel of each '
+                        'file its own dataset',
+             font=("Helvetica", 8), fg="grey", anchor="w").grid(
+                 row=1, column=0, columnspan=2, sticky="w")
+
+    bin_choices = list(fcs_lifetime._VALID_N_BINS)
+    bin_var = tk.IntVar(value=(initial_bins if initial_bins in bin_choices
+                               else 4096))
+    tk.Label(body, text="Histogram bins:", anchor="w").grid(
+        row=2, column=0, sticky="w", pady=3)
+    tk.OptionMenu(body, bin_var, *bin_choices).grid(row=2, column=1,
+                                                    sticky="w")
+    tk.Label(body, text="      applied to every file",
+             font=("Helvetica", 8), fg="grey", anchor="w").grid(
+                 row=3, column=0, columnspan=2, sticky="w")
+
+    btns = tk.Frame(win)
+    btns.pack(pady=8)
+
+    def _next():
+        mode = mode_var.get()
+        n_bins = bin_var.get()
+        datasets, missing = [], []
+        for f in files:
+            avail = tuple(getattr(f, "channels", (1, 2)))
+            wanted = avail if mode == "both" else (int(mode),)
+            got_one = False
+            for ch in wanted:
+                if ch in avail:
+                    datasets.append(_photon_dataset(f, ch, n_bins))
+                    got_one = True
+            if not got_one:
+                missing.append(
+                    f"{f.filepath.name}  "
+                    f"({getattr(f, 'channel_summary', 'one channel')})")
+        if missing:
+            messagebox.showerror(
+                "Channel not available",
+                "These files did not record the chosen channel:\n\n  "
+                + "\n  ".join(missing)
+                + "\n\nPick the other channel, or \"Both channels\".",
+                parent=win)
+            return
+        if len(datasets) < 2:
+            messagebox.showerror(
+                "Not enough datasets",
+                "A global fit needs at least two decays.", parent=win)
+            return
+        win.destroy()
+        on_done(datasets, (mode if mode == "both" else int(mode)), n_bins)
+
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10, pady=4,
+                  command=lambda: (win.destroy(), on_back())
+                  ).pack(side="left", padx=6)
+    tk.Button(btns, text="Next →", width=12, command=_next,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+
+    win.wait_window()
+
+
+def _lifetime_data_dialog(parent, fcs_data, on_done, on_back=None,
+                          initial_channel=None, initial_bins=None):
     """Screen 1 — channel, histogram resolution, and fit window.
 
     Accepts photon data (FCSData) or an already-binned lifetime decay
     (fcs_ifx.LifetimeData).  For a decay there is a single curve and a fixed
     native resolution, so the channel and bin controls are hidden.
+
+    The window entries are never overwritten automatically.  Changing the
+    resolution or the channel used to recompute the peak→end default into
+    them, wiping whatever was typed — but the window is a range in ns,
+    independent of how finely it is binned, and rebinning while keeping the
+    same limits is the usual workflow.  The recompute is still available,
+    on demand, via the "Reset to default" button.
+
+    *initial_channel* / *initial_bins* seed the controls when returning to
+    this screen via Back; invalid values (a channel this file lacks, a
+    resolution not offered) fall back to the ordinary defaults.
     """
     import tkinter as tk
     from tkinter import messagebox
@@ -2175,7 +2489,9 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
     # recorded: a single-channel acquisition has no decay to fit on the other
     # detector, and offering it would produce a fit to an empty histogram.
     available_ch = tuple(getattr(fcs_data, "channels", (1, 2)))
-    ch_var = tk.IntVar(value=(available_ch[0] if available_ch else 1))
+    _ch0 = (initial_channel if initial_channel in available_ch
+            else (available_ch[0] if available_ch else 1))
+    ch_var = tk.IntVar(value=_ch0)
     tk.Label(body, text="Channel:", anchor="w").grid(row=0, column=0, sticky="w", pady=3)
     if is_lt:
         tk.Label(body, text="decay (.ifx)", anchor="w").grid(row=0, column=1, sticky="w")
@@ -2208,7 +2524,8 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
     else:
         bin_choices = list(fcs_lifetime._VALID_N_BINS)
         bin_default = 4096
-    bin_var = tk.IntVar(value=bin_default)
+    bin_var = tk.IntVar(value=(initial_bins if initial_bins in bin_choices
+                               else bin_default))
     if not is_lt:
         tk.Label(body, text="Histogram bins:", anchor="w").grid(row=1, column=0, sticky="w", pady=3)
         tk.OptionMenu(body, bin_var, *bin_choices).grid(row=1, column=1, sticky="w")
@@ -2237,13 +2554,17 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
 
     # Pre-fill with the last-used window if we have one; otherwise compute the
     # per-file default (peak → end).
+    #
+    # No traces on ch_var or bin_var: rebinning or switching channel used to
+    # recompute the default INTO the entries, silently discarding a typed or
+    # session-remembered window.  The window is a range in ns — independent
+    # of binning — so it stays put; "Reset to default" recomputes on demand
+    # for the channel/resolution currently selected.
     if _last_fit_window["start"] is not None and _last_fit_window["end"] is not None:
         start_var.set(f"{_last_fit_window['start']:.2f}")
         end_var.set(f"{_last_fit_window['end']:.2f}")
     else:
         _set_default_window()
-    ch_var.trace_add("write", _set_default_window)
-    bin_var.trace_add("write", _set_default_window)
 
     def _current_window():
         try:
@@ -2266,8 +2587,12 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
             start_var.set(f"{gate[0]:.2f}")
             end_var.set(f"{gate[1]:.2f}")
 
-    tk.Button(win, text="Pick window on histogram…", command=_pick_on_hist,
-              pady=3).pack(pady=(0, 4))
+    wbtns = tk.Frame(win)
+    wbtns.pack(pady=(0, 4))
+    tk.Button(wbtns, text="Pick window on histogram…", command=_pick_on_hist,
+              pady=3).pack(side="left", padx=4)
+    tk.Button(wbtns, text="Reset to default (peak → end)",
+              command=_set_default_window, pady=3).pack(side="left", padx=4)
 
     tk.Label(win, text="The first and last bins (edge artifacts)\n"
                        "are always excluded from the fit.",
@@ -2311,13 +2636,18 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
         win.destroy()
         on_done(channel, n_bins, t_ns, counts, lo, hi)
 
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10, pady=4,
+                  command=lambda: (win.destroy(), on_back())
+                  ).pack(side="left", padx=6)
     tk.Button(btns, text="Next →", width=12, command=_next, pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
 
     win.wait_window()
 
 
-def _select_lifetime_model_dialog(parent, on_choose):
+def _select_lifetime_model_dialog(parent, on_choose, on_back=None,
+                                  initial_key=None):
     """Screen 2 — choose a lifetime model from the registry."""
     import tkinter as tk
 
@@ -2332,7 +2662,9 @@ def _select_lifetime_model_dialog(parent, on_choose):
              font=("Helvetica", 12, "bold"), pady=8).pack()
 
     models = fcs_models.list_lifetime_models()
-    key_var = tk.StringVar(value=models[0].key)
+    _keys = [m.key for m in models]
+    key_var = tk.StringVar(value=(initial_key if initial_key in _keys
+                                  else models[0].key))
 
     list_frame = tk.LabelFrame(win, text="Models", padx=10, pady=6)
     list_frame.pack(fill="x", padx=12, pady=(0, 6))
@@ -2362,6 +2694,10 @@ def _select_lifetime_model_dialog(parent, on_choose):
         win.destroy()
         on_choose(m)
 
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10, pady=4,
+                  command=lambda: (win.destroy(), on_back())
+                  ).pack(side="left", padx=6)
     tk.Button(btns, text="Next →", width=12, command=_next, pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
 
@@ -2369,7 +2705,7 @@ def _select_lifetime_model_dialog(parent, on_choose):
 
 
 def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
-                           t_ns, counts, fit_start, fit_end):
+                           t_ns, counts, fit_start, fit_end, on_back=None):
     """Screen 3 — initial guesses, bounds and fixed flags, then fit."""
     import tkinter as tk
     from tkinter import messagebox
@@ -2528,6 +2864,10 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
         )
         fcs_plottools.show_figure(fig, _axes)
 
+    if on_back is not None:
+        tk.Button(btns, text="← Back", width=10, pady=4,
+                  command=lambda: (win.destroy(), on_back())
+                  ).pack(side="left", padx=6)
     tk.Button(btns, text="Fit", width=12, command=_do_fit, pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
 

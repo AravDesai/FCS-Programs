@@ -1,0 +1,194 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -179,6 +179,7 @@
+ 
+     _build_traces_section(body, fig, axes_list, on_change=_refresh_legend)
+     _build_scale_section(body, fig, axes_list)
++    _build_normalize_section(body, fig, axes_list)
+     _build_limits_section(body, fig, axes_list)
+     _legend_cb["fn"] = _build_legend_section(body, fig, axes_list)
+     _build_label_section(body, fig, axes_list)
+@@ -1053,6 +1054,183 @@
+         pv.trace_add("write", _on_panel)
+ 
+ 
++# ── Trace normalization ───────────────────────────────────────────────────────
++
++# Number of leading points averaged as the normalization reference.  The
++# first plotted point alone is a single noisy estimate of G(tau_min);
++# averaging a few leading points beats it at no cost for a monotone decay.
++# Module-level so the preferences system can retarget it at runtime, the
++# same pattern _FIGURE_FORMAT follows; it is re-read on every toggle.
++_NORMALIZE_K = 3
++
++
++def _build_normalize_section(
++    panel,
++    fig: plt.Figure,
++    axes_list: list,
++) -> None:
++    """
++    Add the "Normalize" LabelFrame to *panel*.
++
++    One checkbox that divides every data trace on the PRIMARY axis by the
++    mean of its own first ``_NORMALIZE_K`` plotted points, so an overlay of
++    correlation curves with different amplitudes can be compared by shape
++    alone.  Display-only and fully reversible: original ydata are cached and
++    restored on uncheck, and CSV exports (written at compute time, upstream
++    of this panel) are untouched — though a figure saved while normalized
++    captures the normalized view, which is the point.
++
++    Scoped to axes_list[0] deliberately: in stacked layouts the lower panel
++    is residuals, and dividing residuals by their own leading points would be
++    meaningless noise amplification, not normalization.
++
++    The reference is the mean of the first PLOTTED points — an estimate of
++    G(tau_min), not a fitted G(0).  Triplet dynamics or afterpulsing inside
++    tau_min therefore stay in the reference; curves differing only in
++    triplet fraction will not converge to exactly 1.  That is a property of
++    post-hoc normalization, stated in the hint rather than hidden.
++
++    Reference lines (drawn with a blended transform — axhline/axvline) are
++    skipped silently — they are not data.  A DATA trace whose reference is
++    zero, NaN, or infinite is left unscaled and reported in one warning box,
++    never silently mis-scaled.
++
++    Data/fit pairing: a fit plotter that draws one dataset as two artists
++    tags them ``data_line._norm_ref = fit_line``.  Such a pair normalizes by
++    the FIT's leading-point mean — the smooth model amplitude at tau_min —
++    with the data scaling by the same factor, never independently.  The
++    contract is an explicit attribute set at plot-creation time; no label or
++    colour heuristics, which a rename in the Traces section would break.
++    """
++    import tkinter as tk
++    from tkinter import messagebox
++
++    ax = axes_list[0]
++
++    lf = tk.LabelFrame(panel, text="Normalize", padx=10, pady=6)
++    lf.pack(fill="x", padx=10, pady=4)
++
++    norm_var = tk.BooleanVar(master=panel, value=False)
++
++    # id(line) -> (line, original ydata copy).  Holding the copy (rather than
++    # a scale factor) makes restore exact to the bit, whatever floating-point
++    # the division did.
++    saved: dict = {}
++    ylabel_box = {"orig": None}
++
++    def _is_reference(line) -> bool:
++        """
++        True for artists that are not data in data space.
++
++        axhline/axvline draw with a BLENDED transform (one coordinate in
++        axes fraction), so comparing against ax.transData separates them
++        from plotted data exactly — unlike the constant-y/constant-x test
++        _artist_description uses for naming, which cannot tell an axhline
++        from a genuinely constant data trace.  Constancy is the right
++        heuristic for choosing a display NAME, but the wrong one here: a
++        constant-zero data trace should reach the explicit zero-reference
++        warning below, not vanish silently into the reference-line skip.
++        """
++        try:
++            return line.get_transform() != ax.transData
++        except Exception:
++            return True        # cannot read it -> do not touch it
++
++    def _rescale_and_draw():
++        ax.relim()
++        ax.autoscale_view()
++        try:
++            fig.canvas.draw_idle()
++        except Exception:
++            pass
++
++    def _apply(*_):
++        if norm_var.get():
++            k = max(1, int(_NORMALIZE_K))
++            skipped, did_any = [], False
++
++            # Reference values are computed from PRE-normalization ydata and
++            # cached per reference line, so a data trace and the fit it is
++            # paired to divide by the IDENTICAL number whatever order the
++            # lines are visited in: a line's reference is always cached
++            # before that line's ydata is mutated.
++            ref_cache: dict = {}
++
++            def _ref_value(ln) -> float:
++                key = id(ln)
++                if key not in ref_cache:
++                    try:
++                        yv = np.asarray(ln.get_ydata(), dtype=float)
++                    except Exception:
++                        yv = np.empty(0)
++                    lead = yv[:k]
++                    lead = lead[np.isfinite(lead)]
++                    ref_cache[key] = (float(lead.mean()) if lead.size
++                                      else float("nan"))
++                return ref_cache[key]
++
++            for line in ax.get_lines():
++                if id(line) in saved or _is_reference(line):
++                    continue
++                # The pairing contract: a fit plotter that draws a dataset as
++                # separate data and fit artists sets data._norm_ref = fit, so
++                # the pair is normalized by the FIT's leading points (smooth
++                # model amplitude at tau_min) and never separately.  A line
++                # without the attribute is its own reference — plain
++                # overlays and figures predating the contract behave exactly
++                # as before.  Explicit attribute only: no label or colour
++                # matching, which a rename in the Traces section would break.
++                ref_line = getattr(line, "_norm_ref", None)
++                if ref_line is None:
++                    ref_line = line
++                ref = _ref_value(ref_line)
++                y = np.asarray(line.get_ydata(), dtype=float)
++                if not np.isfinite(ref) or ref == 0.0:
++                    lbl = line.get_label() or ""
++                    skipped.append(lbl if lbl and not lbl.startswith("_")
++                                   else "(unnamed trace)")
++                    continue
++                saved[id(line)] = (line, y.copy())
++                line.set_ydata(y / ref)
++                did_any = True
++            if did_any and ylabel_box["orig"] is None:
++                ylabel_box["orig"] = ax.get_ylabel()
++                if ylabel_box["orig"]:
++                    ax.set_ylabel(ylabel_box["orig"] + "  (normalized)")
++            _rescale_and_draw()
++            if skipped:
++                messagebox.showwarning(
++                    "Some traces not normalized",
++                    "The normalization reference (the trace's own leading "
++                    "points, or its paired fit's) is zero or not finite "
++                    "for:\n\n  " + "\n  ".join(skipped) +
++                    "\n\nThese traces were left unscaled.",
++                    parent=panel)
++        else:
++            for _id, (line, y) in list(saved.items()):
++                try:
++                    line.set_ydata(y)
++                except Exception:
++                    pass
++            saved.clear()
++            if ylabel_box["orig"] is not None:
++                ax.set_ylabel(ylabel_box["orig"])
++                ylabel_box["orig"] = None
++            _rescale_and_draw()
++
++    tk.Checkbutton(
++        lf, text="Normalize traces  (÷ mean of first "
++                 f"{max(1, int(_NORMALIZE_K))} pts)",
++        variable=norm_var, command=_apply, anchor="w", font=("Helvetica", 9),
++    ).pack(fill="x")
++    tk.Label(
++        lf,
++        text=("      display only — exported CSVs keep physical units.\n"
++              "      Reference is G at the plotted τ min, not a fitted G(0)."),
++        font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
++    ).pack(fill="x")
++
++
+ def _build_limits_section(
+     panel,
+     fig: plt.Figure,
