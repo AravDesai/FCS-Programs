@@ -1,0 +1,55 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -1499,10 +1499,18 @@
+     # twice on rebuild: once from the snapshot and once from the axes scan.
+     # The copies inherit the original artist's label (even when the legend
+     # was created with different display text), so an id miss is resolved by
+-    # label instead.  With duplicate labels the first artist wins — the same
+-    # ambiguity ax.legend() itself has.  A handle matching nothing (a true
+-    # proxy such as the intensity plot's mean-CPS Patch, whose copy carries
+-    # "_nolegend_") is kept as-is.
++    # label instead.
++    #
++    # The label match must be ONE-TO-ONE.  Duplicate labels are ordinary --
++    # an overlay of two files each with a "Ch1 ACF" trace, or a global fit
++    # over same-named datasets -- and mapping every copy of a label to the
++    # same first artist collapses those entries into one identity: they then
++    # exclude and rename as a group, and the artists that lost the match are
++    # re-appended by the axes scan as phantom duplicates.  Each artist is
++    # therefore consumed once, in axes order, so equal-labelled entries keep
++    # distinct identities.  A handle matching nothing (a true proxy such as
++    # the intensity plot's mean-CPS Patch, whose copy carries "_nolegend_")
++    # is kept as-is.
+     _axes_arts = []
+     for _ax in axes_list:
+         _axes_arts.extend(_ax.get_lines())
+@@ -1515,16 +1523,27 @@
+         except Exception:
+             continue
+         if _l and not _l.startswith("_"):
+-            _by_label.setdefault(_l, _a)
++            _by_label.setdefault(_l, []).append(_a)
+ 
+     def _canonical(h):
+         if id(h) in _art_ids:
++            # A real axes artist: claim it so no copy can take it as well.
++            try:
++                _l = h.get_label() or ""
++            except Exception:
++                _l = ""
++            queue = _by_label.get(_l)
++            if queue is not None and h in queue:
++                queue.remove(h)
+             return h
+         try:
+             _l = h.get_label() or ""
+         except Exception:
+             return h
+-        return _by_label.get(_l, h)
++        queue = _by_label.get(_l)
++        if queue:
++            return queue.pop(0)
++        return h
+ 
+     handles = [_canonical(h) for h in handles]
+ 

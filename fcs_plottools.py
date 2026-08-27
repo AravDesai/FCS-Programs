@@ -249,6 +249,7 @@ def show_figure(
     _build_normalize_section(body, fig, axes_list)
     _build_limits_section(body, fig, axes_list)
     _legend_cb["fn"] = _build_legend_section(body, fig, axes_list)
+    _build_annotation_section(body, fig, axes_list)
     _build_label_section(body, fig, axes_list)
     _build_save_section(body, fig)
 
@@ -1499,10 +1500,18 @@ def _build_legend_section(
     # twice on rebuild: once from the snapshot and once from the axes scan.
     # The copies inherit the original artist's label (even when the legend
     # was created with different display text), so an id miss is resolved by
-    # label instead.  With duplicate labels the first artist wins — the same
-    # ambiguity ax.legend() itself has.  A handle matching nothing (a true
-    # proxy such as the intensity plot's mean-CPS Patch, whose copy carries
-    # "_nolegend_") is kept as-is.
+    # label instead.
+    #
+    # The label match must be ONE-TO-ONE.  Duplicate labels are ordinary --
+    # an overlay of two files each with a "Ch1 ACF" trace, or a global fit
+    # over same-named datasets -- and mapping every copy of a label to the
+    # same first artist collapses those entries into one identity: they then
+    # exclude and rename as a group, and the artists that lost the match are
+    # re-appended by the axes scan as phantom duplicates.  Each artist is
+    # therefore consumed once, in axes order, so equal-labelled entries keep
+    # distinct identities.  A handle matching nothing (a true proxy such as
+    # the intensity plot's mean-CPS Patch, whose copy carries "_nolegend_")
+    # is kept as-is.
     _axes_arts = []
     for _ax in axes_list:
         _axes_arts.extend(_ax.get_lines())
@@ -1515,16 +1524,27 @@ def _build_legend_section(
         except Exception:
             continue
         if _l and not _l.startswith("_"):
-            _by_label.setdefault(_l, _a)
+            _by_label.setdefault(_l, []).append(_a)
 
     def _canonical(h):
         if id(h) in _art_ids:
+            # A real axes artist: claim it so no copy can take it as well.
+            try:
+                _l = h.get_label() or ""
+            except Exception:
+                _l = ""
+            queue = _by_label.get(_l)
+            if queue is not None and h in queue:
+                queue.remove(h)
             return h
         try:
             _l = h.get_label() or ""
         except Exception:
             return h
-        return _by_label.get(_l, h)
+        queue = _by_label.get(_l)
+        if queue:
+            return queue.pop(0)
+        return h
 
     handles = [_canonical(h) for h in handles]
 
@@ -1849,6 +1869,333 @@ def _build_legend_section(
     loc_var.trace_add("write", _apply_legend)
 
     return _apply_legend
+
+
+# ── Annotation boxes (fit-result text) ────────────────────────────────────────
+
+# Longest annotation summary shown in the selector row.
+_ANNOT_LABEL_CHARS = 34
+
+
+def _annotation_artists(axes_list: list) -> list:
+    """
+    The editable text boxes on *axes_list*, in drawing order.
+
+    ``ax.texts`` holds exactly the artists added by ``ax.text(...)`` -- the
+    fit-result and linked-parameter boxes the fitters draw.  The title and
+    the axis labels are separate artists and are NOT in this list, so they
+    cannot be reached from here (the Labels section owns them) and there is
+    no risk of this section quietly editing them.
+
+    Blank artists are skipped: several plotting routines pre-create an empty
+    text they may never fill, and offering an empty row to edit would be
+    noise.
+    """
+    out = []
+    for ax in axes_list:
+        for t in getattr(ax, "texts", []):
+            try:
+                if (t.get_text() or "").strip():
+                    out.append(t)
+            except Exception:
+                continue
+    return out
+
+
+def _annotation_summary(text_artist, index: int) -> str:
+    """A one-line description of an annotation for the selector."""
+    try:
+        raw = (text_artist.get_text() or "").strip()
+    except Exception:
+        raw = ""
+    first = raw.splitlines()[0] if raw else ""
+    first = " ".join(first.split())
+    if len(first) > _ANNOT_LABEL_CHARS:
+        first = first[:_ANNOT_LABEL_CHARS - 1].rstrip() + "…"
+    return first or f"annotation {index + 1}"
+
+
+# Corner presets for annotation placement, in axes-fraction coordinates:
+# name -> (x, y, horizontal alignment, vertical alignment).  The alignment
+# is what keeps a box inside the axes as its text changes length -- a
+# right-aligned box grows leftwards from x=0.98 rather than off the edge.
+# "as drawn" is handled separately: it restores the placement the producer
+# used, so a box anchored to data coordinates can always be put back.
+_ANNOT_AS_DRAWN = "as drawn"
+_ANNOT_POSITIONS = {
+    "upper left":   (0.02, 0.95, "left",   "top"),
+    "upper center": (0.50, 0.95, "center", "top"),
+    "upper right":  (0.98, 0.95, "right",  "top"),
+    "center left":  (0.02, 0.50, "left",   "center"),
+    "center":       (0.50, 0.50, "center", "center"),
+    "center right": (0.98, 0.50, "right",  "center"),
+    "lower left":   (0.02, 0.05, "left",   "bottom"),
+    "lower center": (0.50, 0.05, "center", "bottom"),
+    "lower right":  (0.98, 0.05, "right",  "bottom"),
+}
+
+
+def _build_annotation_section(
+    panel,
+    fig: plt.Figure,
+    axes_list: list,
+) -> None:
+    """
+    Add the "Annotations" LabelFrame to *panel*, if the figure has any.
+
+    Fit plots carry a text box of results -- linked parameters,
+    chi-squared, fitted lifetimes.  This section shows or hides each box,
+    moves it between the nine standard positions, and edits its text.  The
+    fitters draw these boxes in the upper right, which is also where a
+    legend most often wants to sit, so moving one out of the other's way is
+    the common case.
+
+    Display-only and session-only, like the Legend section: the parameter
+    tables written at fit time (CSV and xlsx) are untouched by anything
+    here, so an edited box never changes the recorded numbers -- only what
+    this figure shows.  "Revert" restores the text AND the placement the
+    fitter generated.
+
+    Positions are set in axes fractions.  A box the producer anchored to
+    data coordinates is re-anchored to the axes when a preset is chosen --
+    that is what "upper left" has to mean -- and choosing "as drawn" puts
+    it back on its original anchor, so the conversion is never one-way.
+
+    The section is absent when the figure has no annotations, rather than
+    present and empty; overlays built by fcs_plotopen drop annotations, so
+    those figures simply will not show it.
+    """
+    import tkinter as tk
+
+    boxes = _annotation_artists(axes_list)
+    if not boxes:
+        return
+
+    lf = tk.LabelFrame(panel, text="Annotations", padx=10, pady=6)
+    lf.pack(fill="x", padx=10, pady=4)
+
+    # The text and placement each box was created with, so Revert has
+    # something to go back to for the whole session, not just the last edit.
+    original = {}
+    original_pos = {}
+    for t in boxes:
+        try:
+            original[id(t)] = t.get_text()
+        except Exception:
+            original[id(t)] = ""
+        try:
+            original_pos[id(t)] = (t.get_position(),
+                                   t.get_horizontalalignment(),
+                                   t.get_verticalalignment(),
+                                   t.get_transform())
+        except Exception:
+            original_pos[id(t)] = None
+
+    # True while the widgets are being repopulated from a newly selected
+    # box, so the visibility callback does not write the previous box's
+    # state onto the new one.
+    loading = {"busy": False}
+    current = {"artist": boxes[0]}
+
+    # ── Selector, only when there is a choice to make ─────────────────────
+    lb = None
+    if len(boxes) > 1:
+        tk.Label(lf, text="Box:", anchor="w",
+                 font=("Helvetica", 9)).pack(fill="x")
+        lb = tk.Listbox(lf, height=min(4, len(boxes)), activestyle="none",
+                        font=("Courier", 9), exportselection=False)
+        for i, t in enumerate(boxes):
+            lb.insert("end", _annotation_summary(t, i))
+        lb.selection_set(0)
+        lb.pack(fill="x", pady=(0, 4))
+
+    vis_var = tk.BooleanVar(master=panel, value=True)
+    # Declared here rather than beside its OptionMenu below, because _load
+    # (defined before the widgets) sets it when a box is selected.
+    pos_var = tk.StringVar(master=panel, value=_ANNOT_AS_DRAWN)
+
+    def _current_preset(artist) -> str:
+        """
+        The preset name matching *artist*'s placement, or "as drawn".
+
+        A match requires axes-fraction anchoring as well as the right
+        coordinates: the same numbers in data coordinates mean somewhere
+        else entirely.
+        """
+        try:
+            if artist.axes is None or \
+                    artist.get_transform() != artist.axes.transAxes:
+                return _ANNOT_AS_DRAWN
+            x, y = artist.get_position()
+            ha = artist.get_horizontalalignment()
+            va = artist.get_verticalalignment()
+        except Exception:
+            return _ANNOT_AS_DRAWN
+        for name, (px, py, pha, pva) in _ANNOT_POSITIONS.items():
+            if (abs(float(x) - px) < 5e-3 and abs(float(y) - py) < 5e-3
+                    and ha == pha and va == pva):
+                return name
+        return _ANNOT_AS_DRAWN
+
+    def _restore_placement(artist) -> None:
+        """Put *artist* back on the anchor the producer drew it with."""
+        saved = original_pos.get(id(artist))
+        if not saved:
+            return
+        pos, ha, va, transform = saved
+        try:
+            artist.set_transform(transform)
+            artist.set_position(pos)
+            artist.set_horizontalalignment(ha)
+            artist.set_verticalalignment(va)
+        except Exception:
+            pass
+
+    def _draw():
+        try:
+            fig.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _refresh_row(artist):
+        """Keep the selector row in step with an edited box."""
+        if lb is None or artist not in boxes:
+            return
+        i = boxes.index(artist)
+        sel = lb.curselection()
+        lb.delete(i)
+        lb.insert(i, _annotation_summary(artist, i))
+        if sel and sel[0] == i:
+            lb.selection_set(i)
+
+    def _load(artist):
+        loading["busy"] = True
+        try:
+            current["artist"] = artist
+            try:
+                vis_var.set(bool(artist.get_visible()))
+            except Exception:
+                vis_var.set(True)
+            pos_var.set(_current_preset(artist))
+            box.delete("1.0", "end")
+            try:
+                box.insert("1.0", artist.get_text() or "")
+            except Exception:
+                pass
+        finally:
+            loading["busy"] = False
+
+    def _on_select(_event=None):
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if sel and sel[0] < len(boxes):
+            _load(boxes[sel[0]])
+
+    vis_cb = tk.Checkbutton(lf, text="Show annotation", variable=vis_var,
+                            anchor="w", font=("Helvetica", 9))
+    vis_cb.pack(fill="x")
+
+    def _apply_visible(*_):
+        if loading["busy"]:
+            return
+        try:
+            current["artist"].set_visible(vis_var.get())
+        except Exception:
+            return
+        _draw()
+
+    vis_cb.config(command=_apply_visible)
+
+    pos_row = tk.Frame(lf)
+    pos_row.pack(fill="x", pady=(2, 0))
+    tk.Label(pos_row, text="Position:", width=9, anchor="w",
+             font=("Helvetica", 9)).pack(side="left")
+    pos_menu = tk.OptionMenu(pos_row, pos_var, _ANNOT_AS_DRAWN,
+                             *_ANNOT_POSITIONS.keys())
+    pos_menu.config(font=("Helvetica", 9), width=12)
+    pos_menu["menu"].config(font=("Helvetica", 9))
+    pos_menu.pack(side="left", padx=4)
+
+    def _apply_position(*_):
+        if loading["busy"]:
+            return
+        artist = current["artist"]
+        name = pos_var.get()
+        if name == _ANNOT_AS_DRAWN:
+            _restore_placement(artist)
+            _draw()
+            return
+        spec = _ANNOT_POSITIONS.get(name)
+        if spec is None:
+            return
+        x, y, ha, va = spec
+        try:
+            # Anchor to the axes before positioning: a box the producer
+            # placed in DATA coordinates would otherwise land at data
+            # (0.98, 0.95) -- somewhere arbitrary, usually outside the
+            # visible area.  "as drawn" restores the original anchor, so
+            # the conversion is never one-way.
+            if artist.axes is not None:
+                artist.set_transform(artist.axes.transAxes)
+            artist.set_position((x, y))
+            artist.set_horizontalalignment(ha)
+            artist.set_verticalalignment(va)
+        except Exception:
+            return
+        _draw()
+
+    pos_var.trace_add("write", _apply_position)
+
+    box = tk.Text(lf, height=6, width=30, wrap="none",
+                  font=("Courier", 9), relief="solid", borderwidth=1)
+    box.pack(fill="x", pady=(4, 2))
+
+    def _apply_text(_event=None):
+        artist = current["artist"]
+        try:
+            artist.set_text(box.get("1.0", "end-1c"))
+        except Exception:
+            return
+        _refresh_row(artist)
+        _draw()
+        return "break"        # keep Ctrl+Return from also inserting a newline
+
+    def _revert(_event=None):
+        artist = current["artist"]
+        text = original.get(id(artist), "")
+        try:
+            artist.set_text(text)
+        except Exception:
+            return
+        _restore_placement(artist)
+        loading["busy"] = True
+        try:
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            pos_var.set(_current_preset(artist))
+        finally:
+            loading["busy"] = False
+        _refresh_row(artist)
+        _draw()
+
+    btns = tk.Frame(lf)
+    btns.pack(pady=(2, 0))
+    tk.Button(btns, text="Apply text", command=_apply_text, width=11,
+              pady=3).pack(side="left", padx=3)
+    tk.Button(btns, text="Revert", command=_revert, width=9,
+              pady=3).pack(side="left", padx=3)
+    box.bind("<Control-Return>", _apply_text)
+    tk.Label(lf, text="      Ctrl+Return also applies · Revert restores the "
+                      "fitted\n      text and placement · display only, the "
+                      "exported\n      parameter tables keep the fitted "
+                      "values",
+             font=("Helvetica", 8), fg="grey", anchor="w",
+             justify="left").pack(fill="x")
+
+    if lb is not None:
+        lb.bind("<<ListboxSelect>>", _on_select)
+    _load(boxes[0])
 
 
 def _build_label_section(

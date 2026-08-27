@@ -211,6 +211,28 @@ def _main_axes(fig, axes):
     return seq[0] if seq else None
 
 
+def _qualified_label(label, stem: str) -> str:
+    """
+    Prefix a trace's label with the file it came from.
+
+    Overlaid files usually carry identical labels -- every correlation
+    export names its traces "Ch1 ACF" -- so the source file is what
+    distinguishes them: "sampleA — Ch1 ACF".
+
+    The leading underscore that hides a fit's data points from the legend is
+    preserved through the rename, so hidden traces stay hidden.  A trace with
+    no label at all, or matplotlib's "_nolegend_" placeholder, is left alone:
+    naming it would not make it visible in the legend, only odd-looking if it
+    were ever unhidden.
+    """
+    lbl = "" if label is None else str(label)
+    if not lbl or lbl == "_nolegend_" or not stem:
+        return lbl
+    if lbl.startswith("_"):
+        return f"_{stem} — {lbl[1:]}"
+    return f"{stem} — {lbl}"
+
+
 def open_exports(paths, show: bool = True) -> Tuple:
     """
     Reopen several exported analyses overlaid on a single figure.
@@ -221,8 +243,9 @@ def open_exports(paths, show: bool = True) -> Tuple:
 
     What travels, and what does not
     -------------------------------
-    Data traces (Line2D) are carried with their drawn appearance and their
-    original labels.  Reference lines (axhline/axvline) are dropped, since N
+    Data traces (Line2D) are carried with their drawn appearance, and their
+    labels are qualified with the source file's stem ("sampleA — Ch1 ACF")
+    because overlaid exports routinely carry identical trace names.  Reference lines (axhline/axvline) are dropped, since N
     overlaid copies of the same y=0 line are clutter; one is re-drawn if any
     source had one.  Shaded error bands, annotation boxes such as the linked
     parameter table, and residual panels are NOT carried: they cannot be
@@ -338,12 +361,14 @@ def open_exports(paths, show: bool = True) -> Tuple:
                             props[name] = getter()
                         except Exception:
                             pass
-                # The label is kept exactly as the producer set it, including
-                # the leading underscore that hides a fit's data points from
-                # the legend.  Identical labels across files are left alone:
-                # the plot tools' Legend section can rename any entry.
+                # Labels are qualified with the source file's stem, since
+                # overlaid exports routinely carry identical trace names.
+                # The producer's own label is kept after the stem, including
+                # the leading underscore that hides a fit's data points.
                 new_line, = ax.plot(line.get_xdata(), line.get_ydata(),
-                                    label=line.get_label(), **props)
+                                    label=_qualified_label(line.get_label(),
+                                                           p.stem),
+                                    **props)
                 copy_of[id(line)] = new_line
                 ref = getattr(line, "_norm_ref", None)
                 if ref is not None:
