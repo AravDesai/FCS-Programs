@@ -1,0 +1,251 @@
+--- a/fcs_matrixfit.py	2026-08-31 16:56:28.271927190 +0000
++++ b/fcs_matrixfit.py	2026-08-31 20:17:01.795015070 +0000
+@@ -23,6 +23,11 @@
+ the analysis layer: reading correlation CSVs, deciding what sigma means,
+ running one solve per dataset, plotting, and writing the exports.
+ 
++Each dataset produces TWO figures -- the curve with its residuals, and the
++amplitude distribution -- because they are functions of different quantities
++and must not be forced onto a shared axis.  Both go through
++fcs_plottools.show_figure, so each carries the standard plot-controls panel.
++
+ Entry point
+ -----------
+     run_matrix_dialog(fcs_data, parent, workspace_order)
+@@ -56,6 +61,7 @@
+ 
+ import fcs_export
+ import fcs_linsolve
++import fcs_plottools
+ from fcs_fitcommon import new_fit_dir, slug_name, write_params_table
+ 
+ 
+@@ -252,68 +258,129 @@
+ 
+ 
+ # ── Plotting ──────────────────────────────────────────────────────────────────
++#
++# TWO figures, not one.  The curve and its residuals genuinely share an axis --
++# both are functions of lag time -- so they belong in one figure with a real
++# sharex link.  The amplitude distribution is a function of a DIFFERENT
++# quantity: the characteristic time a basis column stands for, which spans the
++# taufactor grid rather than the measured lag range.  Stacking it under the
++# curve in one gridspec aligned the two axes visually while their limits
++# differed, which reads as a shared axis and is not one.  Separate figures also
++# mean each gets its own plot-controls panel.
++#
++# Both x axes are in MILLISECONDS, matching every other correlation figure in
++# the suite (fcs_corr.plot_correlation, fcs_fit.plot_global_fit), so the
++# distribution can be read directly against the curve above it.
+ 
+-def plot_matrix_fit(fit, show=True):
+-    """Curve with fit and residuals, above the recovered amplitude distribution.
++def plot_matrix_curve(fit, show=True):
++    """Correlation curve with the matrix fit, over a residual strip.
+ 
+-    Returns (fig, axes).  One figure per dataset.
++    Returns (fig, axes) with axes = array([ax, axr]).
+     """
+     import matplotlib.pyplot as plt
++    from matplotlib import ticker
+     from matplotlib.gridspec import GridSpec
+ 
+-    fig = plt.figure(figsize=(8.0, 8.0))
+-    gs = GridSpec(3, 1, height_ratios=[3.0, 1.0, 2.6], hspace=0.08, figure=fig)
+-    ax_g = fig.add_subplot(gs[0])
+-    ax_r = fig.add_subplot(gs[1], sharex=ax_g)
+-    ax_d = fig.add_subplot(gs[2])
++    fig = plt.figure(figsize=(8.0, 6.0))
++    gs = GridSpec(2, 1, height_ratios=[3.0, 1.0], hspace=0.08, figure=fig)
++    ax = fig.add_subplot(gs[0])
++    axr = fig.add_subplot(gs[1], sharex=ax)
+ 
+-    tau = fit["tau"]
++    tau_ms = fit["tau"] * 1e3
+     if fit["sigma"] is not None:
+-        ax_g.errorbar(tau, fit["G"], yerr=fit["sigma"], fmt="o", ms=3,
+-                      color="0.35", ecolor="0.75", elinewidth=0.8,
+-                      capsize=0, label="G (data)", zorder=2)
++        ax.errorbar(tau_ms, fit["G"], yerr=fit["sigma"], fmt="o", ms=3,
++                    color="0.35", ecolor="0.75", elinewidth=0.8, capsize=0,
++                    label="G (data)", zorder=2)
+     else:
+-        ax_g.plot(tau, fit["G"], "o", ms=3, color="0.35", label="G (data)",
+-                  zorder=2)
+-    ax_g.plot(tau, fit["G_fit"], "-", lw=1.8, color="#c0392b",
+-              label="A d (matrix fit)", zorder=3)
+-    ax_g.set_xscale("log")
+-    ax_g.set_ylabel("G(τ)")
+-    ax_g.legend(frameon=False, fontsize=9)
+-    ax_g.set_title("%s — matrix method" % fit["name"], fontsize=11)
+-    plt.setp(ax_g.get_xticklabels(), visible=False)
+-
+-    res = (fit["residual_weighted"] if fit["weighted"] else fit["residual"])
+-    ax_r.axhline(0.0, color="0.6", lw=0.8)
+-    ax_r.plot(tau, res, "o", ms=2.5, color="#2c6fbb")
+-    ax_r.set_xscale("log")
+-    ax_r.set_xlabel("lag τ (s)")
+-    ax_r.set_ylabel("resid/σ" if fit["weighted"] else "residual")
++        ax.plot(tau_ms, fit["G"], "o", ms=3, color="0.35", label="G (data)",
++                zorder=2)
++    ax.plot(tau_ms, fit["G_fit"], "-", lw=1.8, color="#c0392b",
++            label="A·d (matrix fit)", zorder=3)
++    ax.set_xscale("log")
++    ax.set_ylabel("G(τ)", fontsize=12)
++    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
++    fcs_plottools.adaptive_legend(ax, base_fontsize=9, loc="upper right")
++    ax.set_title("Matrix method — %s\n%d basis vectors  ·  %d non-zero  ·  "
++                 "χ²/dof = %.4g"
++                 % (fit["name"], fit["n_basis"], fit["n_live"],
++                    fit["chi2_red"]), fontsize=10)
++    plt.setp(ax.get_xticklabels(), visible=False)
++
++    res = fit["residual_weighted"] if fit["weighted"] else fit["residual"]
++    # Labels carry a leading underscore: matplotlib keeps them out of the
++    # legend, while fcs_plottools.collect_artists reads them and strips it, so
++    # the plot-controls trace selector names them instead of falling back to
++    # "unnamed" or to a description that can be actively wrong (an unlabelled
++    # near-zero residual series gets described as a reference line).
++    axr.axhline(0.0, color="grey", linewidth=0.8, label="_zero")
++    axr.plot(tau_ms, res, "o", ms=2.5, color="#2c6fbb", label="_residuals")
++    axr.set_xscale("log")
++    axr.set_xlabel("Lag time τ (ms)", fontsize=12)
++    axr.set_ylabel("resid/σ" if fit["weighted"] else "resid", fontsize=10)
++    axr.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
++    axr.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:.2g}"))
++
++    axes = np.array([ax, axr])
++    if show:
++        fcs_plottools.show_figure(fig, axes)
++    return fig, axes
++
++
++def plot_matrix_distribution(fit, show=True):
++    """Recovered amplitudes against the characteristic time of each column.
++
++    Its own figure: the x axis is the taufactor grid, not the measured lag
++    range, and the two must not be forced to share limits.
++
++    Returns (fig, ax).
++    """
++    import matplotlib.pyplot as plt
++
++    fig = plt.figure(figsize=(8.0, 4.6))
++    ax = fig.add_subplot(1, 1, 1)
+ 
+-    tau_c = fit["tau_char"]
++    tau_ms = fit["tau_char"] * 1e3
+     d = fit["d"]
+-    ax_d.vlines(tau_c, 0.0, d, color="#2c6fbb", lw=1.2)
++    # The stems are a LineCollection.  collect_artists gathers collections but
++    # cannot describe them, so an unlabelled stem plot -- the actual result of
++    # the fit -- appears in the trace selector as "unnamed shading".  The
++    # underscore keeps it from doubling the legend entry of the markers drawn
++    # over it, which carry the same meaning.
++    ax.vlines(tau_ms, 0.0, d, color="#2c6fbb", lw=1.2,
++              label="_amplitude d (stems)")
+     live = d > 0.0
+     if np.any(live):
+-        ax_d.plot(tau_c[live], d[live], "o", ms=3.5, color="#2c6fbb")
+-    ax_d.set_xscale("log")
+-    ax_d.set_xlim(tau_c[0] / 1.5, tau_c[-1] * 1.5)
+-    ax_d.set_xlabel("characteristic time (s)")
+-    ax_d.set_ylabel("amplitude d")
+-    ax_d.axhline(0.0, color="0.6", lw=0.8)
+-
+-    txt = ("ΣD = %.4g    ⟨N⟩ = %.4g\nmean τ = %.4g s    width = %.3g dec\n"
+-           "χ²/dof = %.4g    cond = %.3g"
+-           % (fit["G0"], fit["N"], fit["tau_mean"], fit["width_decades"],
+-              fit["chi2_red"], fit["cond"]))
+-    ax_d.text(0.98, 0.95, txt, transform=ax_d.transAxes, ha="right", va="top",
+-              fontsize=8.5, family="monospace",
+-              bbox=dict(boxstyle="round,pad=0.4", fc="#f7f7f7", ec="0.8"))
++        ax.plot(tau_ms[live], d[live], "o", ms=3.5, color="#2c6fbb",
++                label="amplitude d")
++    ax.axhline(0.0, color="grey", linewidth=0.8, label="_zero")
++    ax.set_xscale("log")
++    ax.set_xlim(tau_ms[0] / 1.5, tau_ms[-1] * 1.5)
++    ax.set_xlabel("Characteristic time (ms)", fontsize=12)
++    ax.set_ylabel("Amplitude d", fontsize=12)
++    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
++    fcs_plottools.adaptive_legend(ax, base_fontsize=9, loc="upper right")
++    ax.set_title("Amplitude distribution — %s" % fit["name"], fontsize=10)
++
++    txt = ("Σd = %.4g    ⟨N⟩ = %.4g\nmean τ = %.4g ms    width = %.3g dec\n"
++           "baseline = %.4g    cond = %.3g"
++           % (fit["G0"], fit["N"], fit["tau_mean"] * 1e3,
++              fit["width_decades"], fit["baseline"], fit["cond"]))
++    ax.text(0.98, 0.95, txt, transform=ax.transAxes, ha="right", va="top",
++            fontsize=8.5, family="monospace",
++            bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+ 
+-    fig.align_ylabels([ax_g, ax_r, ax_d])
+     if show:
+-        plt.show(block=False)
+-    return fig, (ax_g, ax_r, ax_d)
++        fcs_plottools.show_figure(fig, ax)
++    return fig, ax
++
++
++def plot_matrix_fit(fit, show=True):
++    """Both figures for one dataset.
++
++    Returns ((curve_fig, curve_axes), (dist_fig, dist_ax)).
++    """
++    return (plot_matrix_curve(fit, show=show),
++            plot_matrix_distribution(fit, show=show))
+ 
+ 
+ # ── Export ────────────────────────────────────────────────────────────────────
+@@ -614,6 +681,7 @@
+         win.destroy()
+ 
+         for f in fits:
++            # Two windows per dataset: curve+residuals, and the distribution.
+             plot_matrix_fit(f, show=True)
+ 
+         if export_var.get():
+@@ -764,11 +832,39 @@
+     # --- plotting, headless ---------------------------------------------------
+     import matplotlib
+     matplotlib.use("Agg")
+-    fig, axes = plot_matrix_fit(f_new, show=False)
+-    assert len(axes) == 3
+     import matplotlib.pyplot as plt
+-    plt.close(fig)
+-    print("plot builds three panels headlessly")
++    (cfig, caxes), (dfig, dax) = plot_matrix_fit(f_new, show=False)
++    assert len(caxes) == 2, "curve figure is curve + residual strip"
++    assert cfig is not dfig, "the distribution must be its own figure"
++    # The residual strip shares the lag axis; the distribution must NOT be
++    # linked to it, in either direction.
++    assert caxes[1] in caxes[0].get_shared_x_axes().get_siblings(caxes[0])
++    assert dax not in caxes[0].get_shared_x_axes().get_siblings(caxes[0]), \
++        "the distribution axis must not share x with the lag axis"
++    assert caxes[0].get_xlabel() == "" and caxes[1].get_xlabel().endswith("(ms)")
++    assert dax.get_xlabel().endswith("(ms)")
++    # Limits are free to differ, which is the whole point of splitting them.
++    print("  curve x-range  %.4g to %.4g ms" % caxes[0].get_xlim())
++    print("  dist  x-range  %.4g to %.4g ms" % dax.get_xlim())
++    # Every artist must be NAMED for the fcs_plottools trace selector, and the
++    # legend must not double-count the stems and the markers drawn over them.
++    try:
++        import fcs_plottools
++    except Exception as exc:                       # noqa: BLE001
++        print("  fcs_plottools unavailable (%s); skipped the naming check" % exc)
++    else:
++        for axes in (list(caxes), [dax]):
++            for e in fcs_plottools.collect_artists(axes):
++                assert "unnamed" not in e["name"], \
++                    "unnamed artist in the trace selector: %r" % e["name"]
++        dleg = dax.get_legend()
++        texts = [t.get_text() for t in dleg.get_texts()] if dleg else []
++        assert len(texts) == len(set(texts)), "duplicate legend entries: %s" % texts
++        print("  all artists named; %d legend entr%s on the distribution"
++              % (len(texts), "y" if len(texts) == 1 else "ies"))
++    plt.close(cfig)
++    plt.close(dfig)
++    print("two independent figures, lag axis in ms, no cross-figure x sharing")
+ 
+     print("fcs_matrixfit: all self-tests passed.")
+ 

@@ -1,0 +1,40 @@
+--- a/fcs_prefs.py	2026-08-31 15:45:37.674468048 +0000
++++ b/fcs_prefs.py	2026-08-31 15:45:37.743448567 +0000
+@@ -118,6 +118,37 @@
+         help="Reference for the Normalize checkbox: mean of the first "
+              "k plotted points.",
+     ),
++    Pref(
++        key="linsolve_taufactor_min",
++        label="Shortest taufactor",
++        section="Linear decomposition",
++        kind="float",
++        default=1.0e0,
++        target=("fcs_linsolve", "_TAUFACTOR_MIN"),
++        lo=1e-3, hi=1e9,
++        help="taufactor 1 is a characteristic lag time of 1 microsecond.",
++    ),
++    Pref(
++        key="linsolve_taufactor_max",
++        label="Longest taufactor",
++        section="Linear decomposition",
++        kind="float",
++        default=1.0e3,
++        target=("fcs_linsolve", "_TAUFACTOR_MAX"),
++        lo=1e-3, hi=1e9,
++        help="Must exceed the shortest taufactor; 1e3 is 1 millisecond.",
++    ),
++    Pref(
++        key="linsolve_per_decade",
++        label="Basis vectors per decade",
++        section="Linear decomposition",
++        kind="int",
++        default=20,
++        target=("fcs_linsolve", "_TAUFACTOR_PER_DECADE"),
++        lo=1, hi=200,
++        help="Spacing is set per decade, so widening the span above does "
++             "not coarsen the grid.",
++    ),
+ ]
+ 
+ 

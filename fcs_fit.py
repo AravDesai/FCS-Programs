@@ -46,6 +46,7 @@ from fcs_reader import read_fcs, FCSData
 import fcs_lifetime
 import fcs_lifetime_fit
 import fcs_pch_fit
+import fcs_matrixfit
 import fcs_fisher
 import fcs_noise
 
@@ -1325,9 +1326,14 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
     """
     Top-level entry: choose which data type to model, then dispatch.
 
-    Correlation runs the fit workflow implemented in this module; Lifetime and
-    PCH dispatch to run_lifetime_fit_dialog / run_pch_fit_dialog in the
-    fcs_lifetime_fit and fcs_pch_fit modules respectively.
+    Correlation offers two routes.  "Fit" is the nonlinear workflow in this
+    module: pick a model, give guesses and bounds, iterate.  "Matrix Method"
+    is fcs_matrixfit: no model, no guesses, one linear solve for the
+    amplitude of every decay time on a fixed grid.  They answer different
+    questions and share no machinery beyond the dataset picker, which is why
+    they are separate entries here rather than two models in one chooser.
+    Lifetime and PCH dispatch to run_lifetime_fit_dialog / run_pch_fit_dialog
+    in the fcs_lifetime_fit and fcs_pch_fit modules respectively.
 
     ``fcs_data`` may be None, and all three remain available when it is.  Every
     fitter now reads its own exported CSVs -- correlation curves, PCH
@@ -1350,7 +1356,7 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
 
     win = tk.Toplevel(parent)
     win.title("Model data")
-    win.geometry("320x300")
+    win.geometry("340x360")
     win.resizable(False, False)
     win.grab_set()
 
@@ -1361,7 +1367,7 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
 
     tk.Label(win, text="Model data",
              font=("Helvetica", 12, "bold"), pady=8).pack()
-    tk.Label(win, text="Select the data type you want to fit.",
+    tk.Label(win, text="Select the data type and method.",
              font=("Helvetica", 9), fg="grey").pack()
 
     btns = tk.Frame(win, padx=20, pady=12)
@@ -1371,6 +1377,11 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
         win.destroy()
         run_global_fit_dialog(fcs_data, parent=parent,
                               workspace_order=workspace_order)
+
+    def _correlation_matrix():
+        win.destroy()
+        fcs_matrixfit.run_matrix_dialog(fcs_data, parent=parent,
+                                        workspace_order=workspace_order)
 
     def _lifetime():
         win.destroy()
@@ -1384,8 +1395,10 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
         win.destroy()
         fcs_pch_fit.run_pch_fit_dialog(photon_data, parent=parent)
 
-    tk.Button(btns, text="Correlation", width=26, pady=6,
+    tk.Button(btns, text="Correlation (Fit)", width=26, pady=6,
               command=_correlation).pack(pady=4)
+    tk.Button(btns, text="Correlation (Matrix Method)", width=26, pady=6,
+              command=_correlation_matrix).pack(pady=4)
     tk.Button(btns, text="Lifetime", width=26, pady=6,
               command=_lifetime).pack(pady=4)
     tk.Button(btns, text="PCH", width=26, pady=6,
@@ -1402,7 +1415,7 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
     win.wait_window()
 
 
-def _default_dataset_dir(fcs_data=None) -> Optional[Path]:
+def default_dataset_dir(fcs_data=None) -> Optional[Path]:
     """
     Folder the dataset browser should open on.
 
@@ -1491,7 +1504,7 @@ def _order_entries_by_workspace(entries: list, order_names: list) -> list:
     )
 
 
-def _correlation_source() -> fcs_fitdialogs.DatasetSource:
+def correlation_source() -> fcs_fitdialogs.DatasetSource:
     """
     Describe correlation CSVs to the shared dataset picker.
 
@@ -1525,7 +1538,7 @@ def _correlation_source() -> fcs_fitdialogs.DatasetSource:
     )
 
 
-def _select_datasets_dialog(parent, init_dir, on_done, order=None):
+def select_datasets_dialog(parent, init_dir, on_done, order=None):
     """
     Screen — build the list of correlation CSVs to fit.
 
@@ -1744,6 +1757,16 @@ def _select_model_dialog(parent, on_choose):
     tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
 
     win.wait_window()
+
+
+# Public because fcs_matrixfit reaches for them: it offers the same dataset
+# picker over the same correlation CSVs, and a private name shared across
+# modules is how two callers drift apart.  The private aliases keep every
+# existing call site in this module unchanged -- the same pattern
+# fcs_fitcommon documents for its own cross-module helpers.
+_default_dataset_dir   = default_dataset_dir
+_correlation_source    = correlation_source
+_select_datasets_dialog = select_datasets_dialog
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

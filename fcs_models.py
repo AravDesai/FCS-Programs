@@ -184,9 +184,11 @@ _DIFFUSION_3D_1C = FCSModel(
 )
 
 
-MODELS: Dict[str, FCSModel] = {
-    _DIFFUSION_3D_1C.key: _DIFFUSION_3D_1C,
-}
+# The MODELS registry is defined ONCE, after every model in this section has
+# been constructed -- see below.  An earlier partial definition used to sit
+# here, holding only the single-component model; it was shadowed by the real
+# one and so had no effect, but it made this look like the place to register
+# a new model, where doing so would have silently done nothing.
 
 
 # ── Additional models ─────────────────────────────────────────────────────────

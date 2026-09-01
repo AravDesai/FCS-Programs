@@ -28,6 +28,12 @@ import fcs_pch
 import fcs_fit
 import fcs_calib
 import fcs_plotopen
+# Not yet reached from any analysis task; imported so that its
+# module-level constants are present in sys.modules when
+# fcs_prefs.apply() runs below.  apply() skips absent modules
+# silently, which would leave the Linear decomposition preferences
+# inert with no indication of why.
+import fcs_linsolve
 
 # Preferences are optional: the suite runs unchanged without fcs_prefs.py,
 # every module keeping its built-in default constants.
