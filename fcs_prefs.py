@@ -182,6 +182,27 @@ PREFS: list = [
              "the top of the frame.",
     ),
     Pref(
+        key="matrixfit_show_stats_box",
+        label="Show the statistics box on the distribution plot",
+        section="Linear decomposition",
+        kind="bool",
+        default=False,
+        target=("fcs_matrixfit", "_SHOW_STATS_BOX"),
+        help="Off by default because it sits over the plot. The plot-controls "
+             "Annotations section can turn it on for a single figure.",
+    ),
+    Pref(
+        key="matrixfit_summary_components",
+        label="Ranked components in the summary",
+        section="Linear decomposition",
+        kind="int",
+        default=10,
+        target=("fcs_matrixfit", "_SUMMARY_MAX_COMPONENTS"),
+        lo=0, hi=100,
+        help="How many non-zero amplitudes the summary table lists per "
+             "dataset, largest first.",
+    ),
+    Pref(
         key="linsolve_cd_target_chi2_red",
         label="Stop at chi2/dof",
         section="Matrix method stopping",

@@ -41,7 +41,7 @@ fitters use, containing:
 
     <stem>_report.txt          human-readable summary, one block per dataset
     <stem>_curves.csv          tau, G, sigma, fit, residuals   (long format)
-    <stem>_distribution.csv    tau_char, d, d_err per basis vector (long format)
+    <stem>_distribution.xlsx   tau_char, d, d_err per basis vector (long format)
     <stem>_summary.csv/.xlsx   one row of scalars per dataset
 
 The distribution is kept in its own file rather than folded into the summary
@@ -67,6 +67,13 @@ from fcs_fitcommon import (fit_dialog_to_screen, new_fit_dir,
 
 
 # ── Module-level settings ─────────────────────────────────────────────────────
+
+# The distribution figure's statistics box starts hidden: it sits over the plot
+# and is in the way more often than it is wanted.  It is a normal annotation, so
+# the plot-controls Annotations section lists it and its "Show annotation"
+# checkbox turns it on.
+_SHOW_STATS_BOX = False
+
 
 # When True, the matrix-method setup window prefills the taufactor span from
 # what the selected datasets' lag range actually supports, instead of from the
@@ -484,6 +491,29 @@ def plot_matrix_curve(fit, show=True):
     return fig, axes
 
 
+def _fmt_bound_inward(value, round_up, digits=6):
+    """Format a bound so the displayed number stays INSIDE the true one.
+
+    The dialog shows six significant figures.  Plain "%g" rounds to nearest,
+    so about half the time it moves the lower bound down below the first lag,
+    or the upper bound up past the last one -- putting exactly one basis vector
+    outside the supported range and lighting the red warning on a span that was
+    supposed to be the safe one.  Rounding away from the boundary instead
+    (up for the low end, down for the high end) means the displayed value is
+    always usable as typed.
+    """
+    import math
+
+    value = float(value)
+    if value == 0.0 or not math.isfinite(value):
+        return "%g" % value
+    exponent = math.floor(math.log10(abs(value)))
+    scale = 10.0 ** (exponent - digits + 1)
+    quantised = (math.ceil(value / scale) if round_up
+                 else math.floor(value / scale)) * scale
+    return "%g" % quantised
+
+
 def _dw_verdict(dw):
     """Short plain-language reading of a Durbin-Watson value.
 
@@ -564,7 +594,7 @@ def plot_matrix_distribution(fit, show=True):
     # Upper LEFT: the legend sits upper right, and at the default position the
     # two boxes overlapped and neither was readable.
     ax.text(0.02, 0.95, txt, transform=ax.transAxes, ha="left", va="top",
-            fontsize=8.5, family="monospace",
+            fontsize=8.5, family="monospace", visible=bool(_SHOW_STATS_BOX),
             bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
 
     if show:
@@ -618,6 +648,22 @@ def _write_curves(path, fits):
     return Path(path)
 
 
+_DISTRIBUTION_HEADER = ["dataset", "index", "taufactor", "tau_char_s",
+                        "d", "d_err", "pinned"]
+
+
+def _distribution_rows(fits):
+    """Long-format rows, one per basis vector per dataset."""
+    rows = []
+    for f in fits:
+        nm = f["name"].replace(",", "_")
+        for i in range(f["d"].size):
+            rows.append([nm, i, f["taufactor"][i], f["tau_char"][i],
+                         f["d"][i], f["d_err"][i],
+                         "yes" if f["pinned"][i] else "no"])
+    return rows
+
+
 def _write_distribution(path, fits):
     """Long-format amplitude CSV: d paired with the time each column stands for.
 
@@ -630,27 +676,65 @@ def _write_distribution(path, fits):
     the same ones, or the same number of them, and an output column that only
     some bases can fill is an output column that cannot be relied on.
     """
+    mdl_keys = sorted({f.get("basis_model", "?") for f in fits})
+    comments = [
+        "FCS matrix-method fit — amplitude distribution",
+        "written : %s" % datetime.now().isoformat(timespec="seconds"),
+        "basis model : %s" % ", ".join(mdl_keys),
+        "taufactor anchor : taufactor 1 = %g s"
+        % _anchor(mdl_keys[0] if len(mdl_keys) == 1 else None),
+        "note : plot d against tau_char_s; d_err is blank where the amplitude "
+        "is pinned at the d >= 0 bound",
+    ]
+    rows = _distribution_rows(fits)
+
+    path = Path(path).with_suffix(".xlsx")
+    written = fcs_export.write_table_xlsx(
+        path, comments, _DISTRIBUTION_HEADER, rows,
+        sheet_title="amplitude distribution", log_tag="matrixfit")
+    if written is not None:
+        return written
+
+    # openpyxl missing or the write failed.  A distribution that exists only in
+    # the fitter's memory is worse than one in the wrong format, so fall back
+    # to CSV and say so rather than returning nothing.
+    csv_path = path.with_suffix(".csv")
     cv = fcs_export.csv_value
-    with Path(path).open("w", encoding="utf-8-sig", newline="") as fh:
-        fh.write("# FCS matrix-method fit — amplitude distribution\n")
-        fh.write("# written : %s\n" % datetime.now().isoformat(timespec="seconds"))
-        mdl_keys = sorted({f.get("basis_model", "?") for f in fits})
-        fh.write("# basis model : %s\n" % ", ".join(mdl_keys))
-        fh.write("# taufactor anchor : taufactor 1 = %g s\n"
-                 % _anchor(mdl_keys[0] if len(mdl_keys) == 1 else None))
-        fh.write("# note : plot d against tau_char_s; d_err is blank where the "
-                 "amplitude is pinned at the d >= 0 bound\n")
-        fh.write("dataset,index,taufactor,tau_char_s,d,d_err,pinned\n")
-        for f in fits:
-            nm = f["name"].replace(",", "_")
-            for i in range(f["d"].size):
-                fh.write("%s,%d,%s,%s,%s,%s,%s\n" % (
-                    nm, i,
-                    cv(f["taufactor"][i]), cv(f["tau_char"][i]),
-                    cv(f["d"][i]), cv(f["d_err"][i]),
-                    "yes" if f["pinned"][i] else "no"))
-    print("[matrixfit] wrote %s" % path)
-    return Path(path)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        for line in comments:
+            fh.write("# %s\n" % line)
+        fh.write(",".join(_DISTRIBUTION_HEADER) + "\n")
+        for row in rows:
+            fh.write(",".join(v if isinstance(v, str) else cv(v)
+                              for v in row) + "\n")
+    print("[matrixfit] could not write the spreadsheet; wrote %s instead"
+          % csv_path)
+    return csv_path
+
+
+# How many ranked components the summary carries per dataset.  Every basis
+# vector with a non-zero amplitude is a candidate; in practice a fit selects a
+# handful, and a fixed ceiling keeps the table one row per dataset.
+_SUMMARY_MAX_COMPONENTS = 10
+
+
+def ranked_components(fit, limit=None):
+    """Non-zero amplitudes, largest first, with their characteristic times.
+
+    Returns a list of (tau_char_s, d, fraction) with fraction = d / sum(d) over
+    the basis columns.  The baseline is not a component and never appears.
+    """
+    limit = _SUMMARY_MAX_COMPONENTS if limit is None else int(limit)
+    amp = np.asarray(fit["d"], dtype=float)
+    tau_c = np.asarray(fit["tau_char"], dtype=float)
+    live = np.where(amp > 0.0)[0]
+    if live.size == 0:
+        return []
+    total = float(np.sum(amp[live]))
+    order = live[np.argsort(-amp[live])][:max(limit, 0)]
+    return [(float(tau_c[i]), float(amp[i]),
+             float(amp[i] / total) if total > 0.0 else float("nan"))
+            for i in order]
 
 
 _SUMMARY_HEADER = [
@@ -659,14 +743,15 @@ _SUMMARY_HEADER = [
     "n_basis", "n_live", "n_iter", "converged",
     "coherence_max", "coherence_baseline",
     "n_unsupported", "n_lags", "n_dropped", "weighted",
-]
+] + [c for i in range(1, _SUMMARY_MAX_COMPONENTS + 1)
+     for c in ("comp%d_tau_s" % i, "comp%d_d" % i, "comp%d_frac" % i)]
 
 
 def _summary_rows(fits):
     rows = []
     for f in fits:
         span = f.get("span", {})
-        rows.append([
+        row = [
             f["name"], f.get("basis_model", "?"), f.get("method", "?"),
             f["G0"], f["N"], f["tau_mean"], f["width_decades"],
             f["baseline"], f["baseline_err"], f["chi2_red"],
@@ -677,7 +762,16 @@ def _summary_rows(fits):
             f.get("coherence_baseline", float("nan")),
             int(span.get("n_fast", 0)) + int(span.get("n_slow", 0)),
             f["tau"].size, f["n_dropped"], "yes" if f["weighted"] else "no",
-        ])
+        ]
+        # Ranked components, largest amplitude first, padded so every row has
+        # the same width.  Zero amplitudes are omitted rather than listed.
+        comps = ranked_components(f)
+        for k in range(_SUMMARY_MAX_COMPONENTS):
+            if k < len(comps):
+                row.extend(comps[k])
+            else:
+                row.extend([float("nan")] * 3)
+        rows.append(row)
     return rows
 
 
@@ -732,6 +826,15 @@ def _report_lines(fits, grid_desc):
                                                      f["baseline_err"]))
         L.append("non-zero   : %d of %d basis columns"
                  % (f["n_live"], f["n_basis"]))
+        comps = ranked_components(f)
+        if comps:
+            L.append("components, largest first:")
+            L.append("      tau (ms)        d          fraction")
+            for tc, dv, fr in comps:
+                L.append("   %12.6g  %11.6g  %8.4f" % (tc * 1e3, dv, fr))
+            if f["n_live"] > len(comps):
+                L.append("   (%d more not shown; see the summary table)"
+                         % (f["n_live"] - len(comps)))
         if f["notes"]:
             L.append("notes:")
             for nline in f["notes"]:
@@ -754,7 +857,7 @@ def export_matrix_fit(fits, out_source, name_override=None, grid_desc=""):
     print("[matrixfit] wrote %s" % report_path)
 
     curves = _write_curves(out_dir / ("%s_curves.csv" % stem), fits)
-    dist = _write_distribution(out_dir / ("%s_distribution.csv" % stem), fits)
+    dist = _write_distribution(out_dir / ("%s_distribution.xlsx" % stem), fits)
 
     summary_csv, _x = write_params_table(
         out_dir / ("%s_summary.csv" % stem),
@@ -764,7 +867,7 @@ def export_matrix_fit(fits, out_source, name_override=None, grid_desc=""):
          "basis model : %s" % ", ".join(sorted({f.get("basis_model", "?")
                                                 for f in fits})),
          "note : G0 and N exclude the baseline column",
-         "amplitudes : see the companion _distribution.csv"],
+         "amplitudes : see the companion _distribution.xlsx"],
         _SUMMARY_HEADER, _summary_rows(fits),
         log_tag="matrixfit", sheet_title="matrix fit summary")
 
@@ -844,12 +947,14 @@ def _setup_dialog(parent, datasets):
     _lo0, _hi0 = lag_range(datasets)
     _auto_lo, _auto_hi = supported_taufactor_span(_lo0, _hi0)
     if _AUTO_TAUFACTOR_SPAN and _auto_lo is not None:
-        _tf_min0, _tf_max0 = _auto_lo, _auto_hi
+        # Rounded inward, so the span shown is one that actually fits the data.
+        _min_text = _fmt_bound_inward(_auto_lo, round_up=True)
+        _max_text = _fmt_bound_inward(_auto_hi, round_up=False)
     else:
-        _tf_min0 = fcs_linsolve._TAUFACTOR_MIN
-        _tf_max0 = fcs_linsolve._TAUFACTOR_MAX
-    rows = [("Shortest taufactor", "%g" % _tf_min0),
-            ("Longest taufactor", "%g" % _tf_max0),
+        _min_text = "%g" % fcs_linsolve._TAUFACTOR_MIN
+        _max_text = "%g" % fcs_linsolve._TAUFACTOR_MAX
+    rows = [("Shortest taufactor", _min_text),
+            ("Longest taufactor", _max_text),
             ("Vectors per decade", "%d" % fcs_linsolve._TAUFACTOR_PER_DECADE)]
     entries = []
     for label, val in rows:
@@ -1294,16 +1399,31 @@ def _selftest():
                  for p in (rep, cur, dist, summ)}
         assert len(stems) == 1, "the four files must share one stem: %s" % stems
 
-        dl = dist.read_text(encoding="utf-8-sig").splitlines()
-        body = [l for l in dl if not l.startswith("#")]
-        assert body[0] == "dataset,index,taufactor,tau_char_s,d,d_err,pinned", \
-            "the distribution must expose the characteristic time and nothing "\
-            "about how the column was generated: %s" % body[0]
+        assert dist.suffix in (".xlsx", ".csv"), dist.suffix
+        assert _DISTRIBUTION_HEADER == ["dataset", "index", "taufactor",
+                                        "tau_char_s", "d", "d_err", "pinned"]
         for banned in ("t1", "t2", "f1", "k_", "offset"):
-            assert banned not in body[0], "generator internals leaked: " + banned
-        assert len(body) - 1 == 2 * f_new["d"].size
-        cols = body[1].split(",")
-        assert np.isclose(float(cols[3]), float(cols[2]) * _anchor())
+            assert banned not in ",".join(_DISTRIBUTION_HEADER), \
+                "generator internals leaked: " + banned
+        drows = _distribution_rows([f_new, f_old])
+        assert len(drows) == 2 * f_new["d"].size
+        assert np.isclose(drows[0][3], drows[0][2] * _anchor())
+        if dist.suffix == ".xlsx":
+            try:
+                from openpyxl import load_workbook
+            except Exception:                      # noqa: BLE001
+                print("  openpyxl absent; skipped reading the spreadsheet back")
+            else:
+                ws = load_workbook(dist).active
+                hdr = None
+                for row in ws.iter_rows(values_only=True):
+                    if row and row[0] == "dataset":
+                        hdr = list(row)
+                        break
+                assert hdr == _DISTRIBUTION_HEADER, hdr
+                print("  distribution written as .xlsx, %d rows" % len(drows))
+        else:
+            print("  distribution fell back to .csv (no openpyxl)")
 
         cl = [l for l in cur.read_text(encoding="utf-8-sig").splitlines()
               if not l.startswith("#")]
@@ -1316,7 +1436,7 @@ def _selftest():
         assert len(sl) - 1 == 2
         print("exports: report, curves (%d rows), distribution (%d rows), "
               "summary (2 rows), shared stem"
-              % (len(cl) - 1, len(body) - 1))
+              % (len(cl) - 1, len(drows)))
 
     # --- stopping controls actually change how hard the search works ---------
     # The default trusts sigma.  When sigma is generous the fit stops with the
@@ -1364,6 +1484,40 @@ def _selftest():
             pass
         else:
             raise AssertionError("expected ValueError for %r" % bad)
+
+    # --- ranked components, inward-rounded bounds, hidden stats box ----------
+    comps = ranked_components(f_new)
+    assert comps, "a fit with amplitude must produce components"
+    assert all(comps[i][1] >= comps[i + 1][1] for i in range(len(comps) - 1)), \
+        "components must be in descending amplitude order"
+    assert all(c[1] > 0.0 for c in comps), "zero amplitudes must be omitted"
+    allc = ranked_components(f_new, limit=10 ** 6)
+    assert abs(sum(c[2] for c in allc) - 1.0) < 1e-9, "fractions must sum to 1"
+    assert len(ranked_components(f_new, limit=2)) <= 2
+    # The baseline is not a component.
+    assert all(abs(c[1] - f_new["baseline"]) > 1e-15 for c in allc)
+    assert "comp1_tau_s" in _SUMMARY_HEADER and "comp1_frac" in _SUMMARY_HEADER
+    srow = _summary_rows([f_new])[0]
+    assert len(srow) == len(_SUMMARY_HEADER), (len(srow), len(_SUMMARY_HEADER))
+    print("  %d ranked components, largest %.4g ms at fraction %.3f"
+          % (len(comps), comps[0][0] * 1e3, comps[0][2]))
+
+    # Bounds must round INWARD: "%g" alone puts one vector outside the data.
+    for lo_s in (1.2345649e-5, 9.876543e-6, 3.333333e-5):
+        s_lo, s_hi = supported_taufactor_span(lo_s, 0.1)
+        naive = fcs_linsolve.log_taufactor_grid(float("%g" % s_lo),
+                                                float("%g" % s_hi), 20)
+        fixed = fcs_linsolve.log_taufactor_grid(
+            float(_fmt_bound_inward(s_lo, True)),
+            float(_fmt_bound_inward(s_hi, False)), 20)
+        assert span_check(fixed, lo_s, 0.1)["n_fast"] == 0, \
+            "inward rounding must keep every vector inside the lag range"
+        if span_check(naive, lo_s, 0.1)["n_fast"]:
+            print("  inward rounding fixed a case '%%g' got wrong "
+                  "(%.10g -> %s)" % (s_lo, _fmt_bound_inward(s_lo, True)))
+    assert float(_fmt_bound_inward(12.345649, True)) >= 12.345649
+    assert float(_fmt_bound_inward(123456.749, False)) <= 123456.749
+    assert _fmt_bound_inward(0.0, True) == "0"
 
     # --- Durbin-Watson is reported and can govern stopping -------------------
     assert _dw_verdict(0.6).strip().startswith("strong")
@@ -1441,9 +1595,7 @@ def _selftest():
             src2.parent.mkdir(parents=True)
             src2.touch()
             _o, _r, _c, dist2, summ2 = export_matrix_fit([f_alt], src2, "alt", "")
-            head = [l for l in dist2.read_text(encoding="utf-8-sig").splitlines()
-                    if not l.startswith("#")][0]
-            assert head == "dataset,index,taufactor,tau_char_s,d,d_err,pinned"
+            assert dist2.exists() and dist2.stat().st_size > 0
             srow = [l for l in summ2.read_text(encoding="utf-8-sig").splitlines()
                     if not l.startswith("#")][1]
             assert "_selftest_exp" in srow, "the summary must record the basis"
@@ -1536,6 +1688,10 @@ def _selftest():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     (cfig, caxes), (dfig, dax) = plot_matrix_fit(f_new, show=False)
+    stats = [t for t in dax.texts if (t.get_text() or "").strip()]
+    assert stats, "the statistics box must exist so the panel can list it"
+    assert stats[0].get_visible() == bool(_SHOW_STATS_BOX), \
+        "the statistics box must start hidden; it sits over the plot"
     assert len(caxes) == 2, "curve figure is curve + residual strip"
     assert cfig is not dfig, "the distribution must be its own figure"
     # The residual strip shares the lag axis; the distribution must NOT be
