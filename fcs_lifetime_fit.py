@@ -945,8 +945,16 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
             fh.write(f"# channel : Ch{ch}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(names) + "\n")
+        # Cells go through fcs_export.csv_value, the renderer the shared
+        # exporter uses everywhere else, so a non-finite value writes as a
+        # BLANK exactly as it does in every other CSV in the suite and in the
+        # .xlsx written beside it.  Formatting directly with :.10g emits the
+        # text "nan", which reads back as a value rather than as absence --
+        # the divergence csv_value exists to close.  The global writer in this
+        # module already does it this way; this is the single-dataset path
+        # catching up.
         for row in zip(*(cols[n] for n in names)):
-            fh.write(",".join(f"{v:.10g}" for v in row) + "\n")
+            fh.write(",".join(fcs_export.csv_value(v) for v in row) + "\n")
 
     print(f"[lifetime fit] wrote {report_path}")
     print(f"[lifetime fit] wrote {curve_path}")

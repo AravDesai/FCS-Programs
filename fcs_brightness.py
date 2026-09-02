@@ -102,11 +102,6 @@ def brightness_moment(d: FCSData, channel: str, bin_width_s: float) -> dict:
     return {"cps": cps, "mean": mean, "var": var, "Q": Q,
             "eps": eps, "eta": eta, "N": N_est, "ok": ok, "M": int(M)}
 
-
-# Backwards-compatible alias (the moment estimate was the original default).
-molecular_brightness = brightness_moment
-
-
 # ── Clipboard / spreadsheet paste parsing ─────────────────────────────────────
 
 def parse_pasted_table(raw: str) -> List[List[str]]:

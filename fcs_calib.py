@@ -30,7 +30,6 @@ Dependencies
     pip install numpy matplotlib
 """
 
-#compatibility feature ... maybe not needed
 from __future__ import annotations
 
 from datetime import datetime

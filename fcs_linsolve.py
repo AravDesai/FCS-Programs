@@ -83,10 +83,25 @@ _BOUND_ACTIVE_TOL = 1.0e-10
 # chi2, so its improvements stay above an absolute threshold for far longer and
 # the search runs on, adding columns.  Measured: the same curve plus a constant
 # 0.05 ran 278 rounds instead of 8 and shifted <N> by 6%.
+#
+# It assumes sigma is a fair estimate of the scatter.  When sigma is generous,
+# chi2_red passes below 1 while the residuals still run in long systematic
+# arcs, and the fit stops with three columns out of hundreds.  Set this to 0 to
+# switch the criterion off and let min_dchi2 govern; lower it below 1 to demand
+# a closer fit than the error bars nominally require.  All four are exposed in
+# Settings > Preferences and in the matrix-method setup window.
 _CD_MAX_ITER = 500
 _CD_MIN_DCHI2 = 1.0
 _CD_PATIENCE = 3
 _CD_TARGET_CHI2_RED = 1.0
+
+# _CD_TARGET_DW stops on the SHAPE of the residuals rather than their size:
+# the search continues until the Durbin-Watson statistic reaches this, meaning
+# no systematic structure is left.  0 disables it, which is the default,
+# because it is a stronger demand than chi2 and switching it on silently would
+# change every existing fit.  Something around 1.8 is the useful setting when
+# chi2 is stopping too early.
+_CD_TARGET_DW = 0.0
 
 # Default taufactor grid.  Deliberately fine: the spread of the returned
 # amplitudes is the quantity of interest, so the grid must not presuppose which
@@ -145,6 +160,9 @@ class LinearFitResult(object):
         m - n_free.
     chi2_red : float
         chi2 / dof.
+    durbin_watson : float
+        Durbin-Watson statistic of the weighted residuals in lag order.  Near 2
+        means structureless; near 0 means neighbouring residuals share a sign.
     pinned : (n,) bool ndarray
         True where a lower bound is active.
     cond : float
@@ -435,6 +453,7 @@ def solve_linear(G, A, sigma=None, nonneg=False, rescale_errors="auto"):
         d=d, d_err=d_err, d_cov=d_cov,
         G_fit=G_fit, residuals=resid, residuals_weighted=resid_w,
         chi2=chi2, n_free=n_free, dof=dof, chi2_red=chi2_red,
+        durbin_watson=durbin_watson(resid_w),
         pinned=pinned, cond=cond, rank=rank, sigma_used=sigma,
         error_rescaled=do_rescale, method=method_name, warnings=notes,
     )
@@ -442,8 +461,8 @@ def solve_linear(G, A, sigma=None, nonneg=False, rescale_errors="auto"):
 
 def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
                              max_iter=None, min_dchi2=None, patience=None,
-                             target_chi2_red=None, polish=False,
-                             rescale_errors="auto"):
+                             target_chi2_red=None, target_dw=None,
+                             polish=False, rescale_errors="auto"):
     """Greedy coordinate descent: free ONE amplitude per round, best move wins.
 
     Every round, each column is asked how much it could lower chi2 if it alone
@@ -486,8 +505,22 @@ def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
     target_chi2_red : float or None, optional
         Stop as soon as chi2 per degree of freedom falls to this.  Default
         _CD_TARGET_CHI2_RED.  Applied only when a sigma was supplied, since
-        without one chi2_red measures the noise rather than the fit.  Pass None
-        to rely on the min_dchi2 rule alone.
+        without one chi2_red measures the noise rather than the fit.
+
+        ZERO DISABLES IT, which is not a trick: a target of zero can never be
+        reached, so the search runs on the min_dchi2 rule alone.  Disable it
+        when sigma is generous relative to the actual scatter -- chi2_red then
+        drops below 1 while the residuals still show obvious structure, and
+        this criterion stops a fit that plainly is not finished.  None means
+        "use the module default", which is not the same as disabling.
+    target_dw : float or None, optional
+        Stop once the Durbin-Watson statistic of the residuals reaches this,
+        i.e. once no systematic structure is left, and hold it for `patience`
+        consecutive rounds.  Default _CD_TARGET_DW; 0 disables.  DW fluctuates
+        from round to round, so a single crossing is not taken as arrival.
+
+        REQUIRES the data to be in lag order.  G, A and sigma must be sorted by
+        lag before calling or the statistic is meaningless.
     polish : bool
         After selection stops, re-solve ALL selected amplitudes jointly on the
         chosen support.  The support is small by then, so this subproblem is
@@ -522,10 +555,20 @@ def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
     patience = _CD_PATIENCE if patience is None else int(patience)
     if target_chi2_red is None:
         target_chi2_red = _CD_TARGET_CHI2_RED
+    if target_dw is None:
+        target_dw = _CD_TARGET_DW
+    target_dw = float(target_dw)
+    if target_dw < 0.0:
+        raise ValueError("target_dw must be >= 0 (0 disables the criterion)")
+    if target_dw == 0.0:
+        target_dw = None
     if target_chi2_red is not None:
         target_chi2_red = float(target_chi2_red)
-        if target_chi2_red <= 0.0:
-            raise ValueError("target_chi2_red must be > 0")
+        if target_chi2_red < 0.0:
+            raise ValueError("target_chi2_red must be >= 0 "
+                             "(0 disables the criterion)")
+        if target_chi2_red == 0.0:
+            target_chi2_red = None
     if max_iter < 1:
         raise ValueError("max_iter must be >= 1")
     if min_dchi2 < 0.0:
@@ -570,6 +613,7 @@ def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
     chi2_history = [chi2]
     selection_order = []
     stalled = 0
+    dw_held = 0
     converged = False
     n_iter = 0
 
@@ -597,6 +641,20 @@ def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
         chi2_history.append(chi2)
         if j not in selection_order:
             selection_order.append(j)
+
+        if target_dw is not None:
+            dw_now = durbin_watson(r)
+            if np.isfinite(dw_now) and dw_now >= target_dw:
+                dw_held += 1
+                if dw_held >= patience:
+                    converged = True
+                    notes.append("Stopped at Durbin-Watson = %.4g, at or above "
+                                 "the target of %.4g for %d consecutive rounds, "
+                                 "after %d rounds."
+                                 % (dw_now, target_dw, patience, n_iter))
+                    break
+            else:
+                dw_held = 0
 
         if target_chi2_red is not None and sigma is not None:
             n_now = int(np.sum(~(bounded & (d <= 0.0))))
@@ -687,6 +745,7 @@ def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
         d=d, d_err=d_err, d_cov=d_cov,
         G_fit=G_fit, residuals=resid, residuals_weighted=resid_w,
         chi2=chi2, n_free=n_free, dof=dof, chi2_red=chi2_red,
+        durbin_watson=durbin_watson(resid_w),
         pinned=pinned, cond=cond, rank=rank, sigma_used=sigma,
         error_rescaled=do_rescale, method="coordinate_descent",
         warnings=notes,
@@ -694,6 +753,99 @@ def solve_coordinate_descent(G, A, sigma=None, nonneg=False,
         chi2_history=np.asarray(chi2_history),
         selection_order=np.asarray(selection_order, dtype=int),
     )
+
+
+def durbin_watson(residuals):
+    """Durbin-Watson statistic for residuals ORDERED BY LAG.
+
+        DW = sum((r[i] - r[i-1])^2) / sum(r^2)
+
+    Roughly 2 when consecutive residuals are uncorrelated, near 0 when
+    neighbours share a sign, and above 2 when they alternate.  It answers a
+    different question from chi2: chi2 asks whether the misfit is small, DW
+    asks whether what is left is structureless.  A fit can have chi2 per degree
+    of freedom well below 1 -- because the error bars are generous -- while its
+    residuals still run in long systematic arcs, and DW is what catches that.
+
+    ORDER MATTERS.  The statistic is meaningless on residuals that are not in
+    lag order, so callers must sort before calling.
+
+    Returns NaN for fewer than two points or an all-zero residual vector.
+    """
+    r = np.asarray(residuals, dtype=float).ravel()
+    if r.size < 2:
+        return float("nan")
+    denom = float(np.dot(r, r))
+    if denom <= 0.0:
+        return float("nan")
+    return float(np.sum(np.diff(r) ** 2) / denom)
+
+
+def column_coherence(A, groups=None):
+    """Largest overlap between distinct columns of A.
+
+    Coherence is the cosine of the angle between two columns: 1.0 means they
+    are the same direction and the data cannot tell their amplitudes apart, so
+    this is the pairwise counterpart to the condition number.  Where `cond`
+    says the basis as a whole is degenerate, this says WHICH two columns are
+    responsible.
+
+    Pass the WEIGHTED design matrix (A / sigma).  Degeneracy is only meaningful
+    relative to the noise: two columns that differ where the errors are large
+    are not distinguishable in practice.
+
+    Parameters
+    ----------
+    A : (m, n) array
+    groups : sequence of length n, optional
+        A label per column.  When given, the largest overlap between columns
+        with DIFFERENT labels is reported as well.  That is the number that
+        says whether two families of basis vector are separable at all: a
+        cross-family coherence near 1 means the fit can move amplitude from one
+        family to the other without changing the curve it predicts.
+
+    Returns
+    -------
+    dict with 'max' and 'pair', plus 'cross_max' and 'cross_pair' when groups
+    is given.  Values are NaN when there are too few usable columns.
+    """
+    A = _as_matrix(A, "A")
+    n = A.shape[1]
+    out = {"max": float("nan"), "pair": None}
+    if groups is not None:
+        out["cross_max"] = float("nan")
+        out["cross_pair"] = None
+    if n < 2:
+        return out
+
+    norms = np.linalg.norm(A, axis=0)
+    ok = norms > 0.0
+    if int(np.sum(ok)) < 2:
+        return out
+    U = A[:, ok] / norms[ok]
+    idx = np.where(ok)[0]
+
+    C = np.abs(U.T.dot(U))
+    np.fill_diagonal(C, -1.0)
+    flat = int(np.argmax(C))
+    i, j = np.unravel_index(flat, C.shape)
+    out["max"] = float(C[i, j])
+    out["pair"] = (int(idx[i]), int(idx[j]))
+
+    if groups is not None:
+        g = np.asarray(groups, dtype=object).ravel()
+        if g.size != n:
+            raise ValueError("groups has %d entries but A has %d columns"
+                             % (g.size, n))
+        gk = g[ok]
+        same = gk[:, None] == gk[None, :]
+        Cx = np.where(same, -1.0, C)
+        if np.max(Cx) >= 0.0:
+            flat = int(np.argmax(Cx))
+            i, j = np.unravel_index(flat, Cx.shape)
+            out["cross_max"] = float(Cx[i, j])
+            out["cross_pair"] = (int(idx[i]), int(idx[j]))
+    return out
 
 
 def apply_mask(G, A, sigma=None, mask=None):
@@ -716,13 +868,93 @@ def apply_mask(G, A, sigma=None, mask=None):
 
 
 # --------------------------------------------------------------------------
-# Basis generation
+# Basis models
 # --------------------------------------------------------------------------
 #
-# Port of the MATLAB `basismodel(taufactor)`.  One basis vector is the shape of
-# the curve produced by a single species whose characteristic decay time is
+# A basis model is a generating function plus the two facts the rest of the
+# pipeline needs about it:
+#
+#   anchor_s   the characteristic time, in seconds, of the column at
+#              taufactor = 1.  The grid is expressed in taufactors; everything
+#              downstream reports characteristic TIMES, and this is the only
+#              conversion between them.
+#   build      f(t_seconds, taufactors) -> (m, n) array of shape-only columns.
+#
+# Nothing outside this section knows how a column is computed.  Adding a model
+# is one call to register_basis_model, and no caller changes.  In particular the
+# internal parameters of any one generating function -- the two component times
+# of the model below, say -- are its own business and never reach an output.
+
+class BasisModel(object):
+    """One interchangeable generating function for the basis columns.
+
+    Parameters
+    ----------
+    key : str
+        Stable identifier, recorded in exports so a result says which basis
+        produced it.  Never rename a released key.
+    name : str
+        Human label for menus.
+    anchor_s : float
+        Characteristic time in seconds at taufactor = 1.
+    build : callable
+        ``build(t_seconds, taufactors) -> (m, n)``.  Columns carry SHAPE only:
+        no amplitude, no additive offset, no baseline column.  The caller adds
+        the baseline; the amplitudes live in d.
+    description : str
+        One line shown beside the name.
+    """
+
+    def __init__(self, key, name, anchor_s, build, description=""):
+        self.key = str(key)
+        self.name = str(name)
+        self.anchor_s = float(anchor_s)
+        if self.anchor_s <= 0.0:
+            raise ValueError("anchor_s must be > 0")
+        if not callable(build):
+            raise ValueError("build must be callable")
+        self.build = build
+        self.description = str(description)
+
+    def __repr__(self):
+        return "<BasisModel %s anchor=%.4g s>" % (self.key, self.anchor_s)
+
+
+BASIS_MODELS = {}
+
+
+def register_basis_model(model):
+    """Add *model* to the registry, returning it.  Refuses to overwrite."""
+    if not isinstance(model, BasisModel):
+        raise ValueError("expected a BasisModel")
+    if model.key in BASIS_MODELS:
+        raise ValueError("a basis model called %r is already registered"
+                         % model.key)
+    BASIS_MODELS[model.key] = model
+    return model
+
+
+def get_basis_model(model=None):
+    """Resolve *model*: a key, a BasisModel, or None for the default."""
+    if model is None:
+        model = _DEFAULT_BASIS_MODEL
+    if isinstance(model, BasisModel):
+        return model
+    try:
+        return BASIS_MODELS[model]
+    except KeyError:
+        raise ValueError("unknown basis model %r; registered: %s"
+                         % (model, ", ".join(sorted(BASIS_MODELS)) or "none"))
+
+
+# --------------------------------------------------------------------------
+# The two-term optical model
+# --------------------------------------------------------------------------
+#
+# Port of the MATLAB `basismodel(taufactor)`.  One column is the shape of the
+# curve produced by a single species whose characteristic decay time is
 # `taufactor` times a hardcoded reference time.  The two-term functional form
-# and every numerical constant below are taken verbatim from that script.
+# and every numerical constant are taken verbatim from that script.
 #
 # Two deliberate departures from the MATLAB:
 #   1. t is supplied by the caller instead of a hardcoded logspace, so the basis
@@ -745,23 +977,117 @@ _BASIS_MATLAB_OFFSET = -9.573317357e-05   # MATLAB offset, retained for the
                                           # reference check only; not used in
                                           # the basis columns
 
-# Value of the baseline column.  Ones by default: the basis columns are order
-# unity at short lag, so a column of ones is on the same scale and costs
-# nothing in conditioning.
-_BASELINE_VALUE = 1.0
+# taufactor = 1 is a characteristic time of one microsecond.
+_TWO_TERM_ANCHOR_S = 1.0e-06
 
 
-def basis_component_times(taufactors):
-    """Return the two component decay times, in seconds, for each taufactor.
+def _two_term_component_times(taufactors):
+    """The model's two internal component times.  PRIVATE.
 
-    At taufactor = 1 these are roughly 5.385e-07 s and 2.083e-06 s.
+    An implementation detail of this generating function.  It is not reported,
+    exported or plotted: a different generating function need not have two of
+    anything, and the pipeline must not learn to expect it.
     """
     tf = np.asarray(taufactors, dtype=float).ravel()
     usconversion = _BASIS_US_SCALE / _BASIS_REF_TAU
     return tf * usconversion * _BASIS_TAU1, tf * usconversion * _BASIS_TAU2
 
 
-def build_basis(t, taufactors, t_units=None, include_baseline=True):
+def _build_two_term(t_sec, taufactors):
+    """Shape-only columns for the two-term optical model."""
+    t1, t2 = _two_term_component_times(taufactors)
+    ksq = _BASIS_K ** 2
+    r1 = t_sec[:, None] / t1[None, :]
+    r2 = t_sec[:, None] / t2[None, :]
+    d1 = (1.0 + r1) ** (-1.0) * (1.0 + r1 / ksq) ** (-0.5)
+    d2 = (1.0 + r2) ** (-1.0) * (1.0 + r2 / ksq) ** (-0.5)
+    return _BASIS_G0 * (_BASIS_F1 * d1 + (1.0 - _BASIS_F1) * d2)
+
+
+# The key names the CALIBRATION the constants came from, not the functional
+# form, because that is what distinguishes one basis set from the next: a
+# different dye, buffer or pinhole gives different constants through the same
+# equations.  The key is written into every export, so it is never renamed once
+# results exist under it.
+register_basis_model(BasisModel(
+    key="rh110_pbs_tween_75um_ph",
+    name="Rh110 PBS 0.01% Tween, 75 micron PH",
+    anchor_s=_TWO_TERM_ANCHOR_S,
+    build=_build_two_term,
+    description="Rhodamine 110 in PBS with 0.01% Tween, 75 micron pinhole. "
+                "Ported from basismodel.m.",
+))
+
+_DEFAULT_BASIS_MODEL = "rh110_pbs_tween_75um_ph"
+
+
+# --------------------------------------------------------------------------
+# The plain 3D Gaussian model
+# --------------------------------------------------------------------------
+#
+# Single diffusing species in a 3D Gaussian observation volume, with nothing
+# else in it: no triplet term, no exponential, no second component, no optical
+# perturbation.
+#
+#     G(t) = (1 + t/tau_D)^-1 * (1 + t/(kappa^2 tau_D))^-1/2
+#
+# The characteristic time IS tau_D, so taufactor maps to it directly at one
+# microsecond per unit -- the same anchor as the two-term set, which means a
+# stored grid span covers the same physical range under either.
+
+# Structure parameter kappa = omega_z / omega_xy.
+#
+# CHECK THIS BEFORE RELYING ON THE SET.  The value is carried over from the
+# two-term calibration, where it was fitted rather than measured, and 19.9 is
+# far above the 3-8 a 3D Gaussian volume usually shows.  kappa is weakly
+# determined by FCS data at the best of times: it acts only on the axial
+# rolloff, which for these lag ranges sits at the far tail of the curve.  It is
+# a module constant so that changing it is one edit here.
+_GAUSS3D_KAPPA = 19.90748158
+_GAUSS3D_ANCHOR_S = 1.0e-06
+
+
+def _build_gauss3d(t_sec, taufactors):
+    """Shape-only columns for the plain 3D Gaussian diffusion model."""
+    tau_d = taufactors * _GAUSS3D_ANCHOR_S
+    r = t_sec[:, None] / tau_d[None, :]
+    return (1.0 + r) ** (-1.0) * (1.0 + r / (_GAUSS3D_KAPPA ** 2)) ** (-0.5)
+
+
+register_basis_model(BasisModel(
+    key="gauss3d_1comp",
+    name="3D Gaussian, single component",
+    anchor_s=_GAUSS3D_ANCHOR_S,
+    build=_build_gauss3d,
+    description="One species diffusing in a 3D Gaussian volume, kappa = "
+                "%.4f.  No triplet, exponential or second component."
+                % _GAUSS3D_KAPPA,
+))
+
+
+# --------------------------------------------------------------------------
+# Building A
+# --------------------------------------------------------------------------
+
+# Value of the baseline column.  Ones by default: the basis columns are order
+# unity at short lag, so a column of ones is on the same scale and costs
+# nothing in conditioning.
+_BASELINE_VALUE = 1.0
+
+
+def characteristic_times(taufactors, model=None):
+    """Characteristic time in SECONDS for each taufactor.
+
+    The one fact about a basis vector that any output needs: which decay time
+    it stands for.  Everything else about how the column was generated stays
+    inside the model.
+    """
+    tf = np.asarray(taufactors, dtype=float).ravel()
+    return tf * get_basis_model(model).anchor_s
+
+
+def build_basis(t, taufactors, t_units=None, include_baseline=True,
+                model=None):
     """Populate the columns of A from a list of taufactors.
 
     Parameters
@@ -769,17 +1095,20 @@ def build_basis(t, taufactors, t_units=None, include_baseline=True):
     t : array_like, shape (m,)
         Lag times, one per element of G, in the same order.
     taufactors : array_like, shape (n_tau,)
-        Column j is basismodel(taufactors[j]) evaluated at t.
     t_units : {'s', 'ms', 'us', 'ns'}, optional
-        Units of t.  Defaults to the module constant _BASIS_T_UNITS.  The basis
-        constants are in seconds; t is converted on the way in.
+        Units of t.  Defaults to _BASIS_T_UNITS.  Models work in seconds; t is
+        converted on the way in.
     include_baseline : bool
         Append a constant column as the LAST column, fitting a free baseline.
+    model : str, BasisModel or None
+        Generating function.  None uses the registry default.
 
     Returns
     -------
     A : (m, n_tau + 1) ndarray if include_baseline else (m, n_tau)
     """
+    mdl = get_basis_model(model)
+
     t = _as_vector(t, "t")
     if np.any(t < 0.0):
         raise ValueError("t contains negative lag times")
@@ -799,31 +1128,24 @@ def build_basis(t, taufactors, t_units=None, include_baseline=True):
         raise ValueError("taufactors must be strictly positive; got min %.6g"
                          % float(np.min(tf)))
 
-    t1, t2 = basis_component_times(tf)          # each (n_tau,)
-    ksq = _BASIS_K ** 2
-
-    r1 = t_sec[:, None] / t1[None, :]           # r1[i, j] = t[i] / t1[j]
-    r2 = t_sec[:, None] / t2[None, :]
-
-    d1 = (1.0 + r1) ** (-1.0) * (1.0 + r1 / ksq) ** (-0.5)
-    d2 = (1.0 + r2) ** (-1.0) * (1.0 + r2 / ksq) ** (-0.5)
-
-    f1 = _BASIS_F1
-    A = _BASIS_G0 * (f1 * d1 + (1.0 - f1) * d2)
+    A = np.asarray(mdl.build(t_sec, tf), dtype=float)
+    if A.shape != (t.size, tf.size):
+        raise ValueError("basis model %r returned shape %s, expected %s"
+                         % (mdl.key, A.shape, (t.size, tf.size)))
 
     if include_baseline:
         A = np.hstack([A, np.full((t.size, 1), _BASELINE_VALUE)])
 
     if not np.all(np.isfinite(A)):
-        raise ValueError("basis evaluation produced non-finite values; check t "
-                         "and taufactors")
+        raise ValueError("basis model %r produced non-finite values; check t "
+                         "and taufactors" % mdl.key)
     return A
 
 
-def basis_vector(t, taufactor, t_units=None):
+def basis_vector(t, taufactor, t_units=None, model=None):
     """Evaluate a single basis curve at lag times t.  No baseline column."""
     return build_basis(t, [taufactor], t_units=t_units,
-                       include_baseline=False)[:, 0]
+                       include_baseline=False, model=model)[:, 0]
 
 
 def log_taufactor_grid(tf_min=None, tf_max=None, per_decade=None):
@@ -897,18 +1219,92 @@ def _self_test():
         err = np.max(np.abs(A_b[:, j] - ref))
         print("  taufactor %9.4g  max abs deviation %.3e" % (tf, err))
         assert err < 1e-14
-    print("  taufactor=1 component times: t1=%.6e s  t2=%.6e s"
-          % tuple(float(x[0]) for x in basis_component_times([1.0])))
+    print("  taufactor=1 characteristic time: %.6e s"
+          % float(characteristic_times([1.0])[0]))
 
     print("=" * 70)
-    print("TEST 2: unit conversion")
+    print("TEST 2: the basis is pluggable")
+    shipped = {"rh110_pbs_tween_75um_ph", "gauss3d_1comp"}
+    assert set(BASIS_MODELS) == shipped, sorted(BASIS_MODELS)
+    mdl = get_basis_model()
+    assert get_basis_model(_DEFAULT_BASIS_MODEL) is mdl
+    assert get_basis_model(mdl) is mdl
+    assert np.isclose(characteristic_times([1.0])[0], mdl.anchor_s)
+    assert np.isclose(characteristic_times([250.0], mdl)[0], 250.0 * mdl.anchor_s)
+
+    # A second model, registered here and removed again, proving that adding
+    # one needs no change anywhere else.  Single exponential, anchored at 1 ms.
+    def _build_exp(t_sec, taufactors):
+        return np.exp(-t_sec[:, None] / (taufactors[None, :] * 1.0e-3))
+
+    alt = register_basis_model(BasisModel(
+        key="_selftest_exp", name="Single exponential", anchor_s=1.0e-3,
+        build=_build_exp, description="self-test only"))
+    try:
+        A_alt = build_basis(t_ml, [1.0, 10.0], t_units="s", model="_selftest_exp")
+        assert A_alt.shape == (100, 3), A_alt.shape       # 2 columns + baseline
+        assert np.allclose(A_alt[:, 0], np.exp(-t_ml / 1.0e-3))
+        assert np.isclose(characteristic_times([1.0], "_selftest_exp")[0], 1.0e-3)
+        assert not np.allclose(A_alt[:, 0],
+                               build_basis(t_ml, [1.0], t_units="s",
+                                           include_baseline=False)[:, 0])
+        print("  swapped in %r: anchor %.4g s, columns differ from the default"
+              % (alt.key, alt.anchor_s))
+
+        # The whole solver path works on the alternative basis unchanged.
+        d_true = np.array([0.4, 0.1, -0.01])
+        G_alt = A_alt.dot(d_true) + 0.002 * rng.randn(100)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            r_alt = solve_linear(G_alt, A_alt, sigma=0.002 * np.ones(100),
+                                 nonneg=basis_nonneg_mask(2))
+        print("  solver on the alternative basis: chi2_red %.3f, d = %s"
+              % (r_alt.chi2_red, np.array2string(r_alt.d, precision=3)))
+        assert np.max(np.abs(r_alt.d - d_true)) < 0.02
+
+        for bad in (lambda: get_basis_model("nope"),
+                    lambda: register_basis_model(alt),
+                    lambda: register_basis_model("not a model"),
+                    lambda: BasisModel("k", "n", 0.0, _build_exp),
+                    lambda: BasisModel("k", "n", 1.0, "not callable")):
+            try:
+                bad()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("expected ValueError")
+        print("  registry rejects duplicates, unknown keys and bad models")
+    finally:
+        del BASIS_MODELS["_selftest_exp"]
+    assert set(BASIS_MODELS) == shipped
+
+    # The plain 3D Gaussian set, checked against the closed form.
+    tD = 5.0e-4
+    got = build_basis(t_ml, [tD / _GAUSS3D_ANCHOR_S], t_units="s",
+                      include_baseline=False, model="gauss3d_1comp")[:, 0]
+    ref = ((1.0 + t_ml / tD) ** -1.0
+           * (1.0 + t_ml / (_GAUSS3D_KAPPA ** 2 * tD)) ** -0.5)
+    assert np.max(np.abs(got - ref)) < 1e-15
+    # It must be the PLAIN model: no second term, so it differs
+    # from the two-term set at the same characteristic time.
+    two = build_basis(t_ml, [tD / _TWO_TERM_ANCHOR_S], t_units="s",
+                      include_baseline=False)[:, 0]
+    print("  gauss3d matches its closed form; differs from the "
+          "two-term set by up to %.4f at the same tau"
+          % np.max(np.abs(got - two)))
+    assert np.max(np.abs(got - two)) > 0.01
+    assert np.isclose(characteristic_times([250.0], "gauss3d_1comp")[0],
+                      250.0 * _GAUSS3D_ANCHOR_S)
+
+    print("=" * 70)
+    print("TEST 3: unit conversion")
     A_s = build_basis(t_ml, [5.0], t_units="s", include_baseline=False)
     A_ms = build_basis(t_ml * 1e3, [5.0], t_units="ms", include_baseline=False)
     assert np.allclose(A_s, A_ms, rtol=0, atol=1e-15)
     print("  s and ms paths agree to %.2e" % float(np.max(np.abs(A_s - A_ms))))
 
     print("=" * 70)
-    print("TEST 3: baseline column and bounds mask")
+    print("TEST 4: baseline column and bounds mask")
     A_bl = build_basis(t_ml, tf_list, t_units="s", include_baseline=True)
     assert A_bl.shape == (100, 5)
     assert np.all(A_bl[:, -1] == _BASELINE_VALUE)
@@ -918,7 +1314,7 @@ def _self_test():
           % (A_bl.shape, baseline_index(len(tf_list))))
 
     print("=" * 70)
-    print("TEST 4: default grid")
+    print("TEST 5: default grid")
     grid = log_taufactor_grid()
     decades = np.log10(_TAUFACTOR_MAX / _TAUFACTOR_MIN)
     print("  %d taufactors from %.4g to %.4g (%d per decade)"
@@ -930,7 +1326,7 @@ def _self_test():
     assert np.isclose(grid[-1], _TAUFACTOR_MAX)
 
     print("=" * 70)
-    print("TEST 5: recovery with a free baseline")
+    print("TEST 6: recovery with a free baseline")
     t5 = np.logspace(-6, -1, 128)
     tf5 = np.array([2.0, 20.0, 400.0])
     A5 = build_basis(t5, tf5, t_units="s")
@@ -951,7 +1347,7 @@ def _self_test():
     assert r5.n_free == 4 and r5.dof == 124
 
     print("=" * 70)
-    print("TEST 6: unweighted path engages auto rescaling")
+    print("TEST 7: unweighted path engages auto rescaling")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         r6 = solve_linear(G5, A5, sigma=None)
@@ -963,7 +1359,7 @@ def _self_test():
     print("  auto-on-unweighted and explicit override both behave")
 
     print("=" * 70)
-    print("TEST 7: fine grid, constraint only, no regularisation")
+    print("TEST 8: fine grid, constraint only, no regularisation")
     grid7 = log_taufactor_grid(1.0, 1.0e4, 20)
     A7 = build_basis(t5, grid7, t_units="s")
     truth = np.zeros(grid7.size + 1)
@@ -987,7 +1383,7 @@ def _self_test():
     assert 0.4 < r7.chi2_red < 2.0
 
     print("=" * 70)
-    print("TEST 8: coordinate descent on the regime the joint solve cannot handle")
+    print("TEST 9: coordinate descent on the regime the joint solve cannot handle")
     t8 = np.logspace(-5, -1, 65)                 # 65 lag points
     g8 = log_taufactor_grid(1e-2, 1e4, 100)      # 601 basis vectors
     A8 = build_basis(t8, g8, t_units="s")
@@ -1018,7 +1414,7 @@ def _self_test():
     assert 3.0 < g8[peak] < 300.0, "peak should be within a decade of the truth"
 
     print("=" * 70)
-    print("TEST 9: stopping rule, patience, and the polish option")
+    print("TEST 10: stopping rule, patience, and the polish option")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         loose = solve_coordinate_descent(G8, A8, sigma=s8, nonneg=mask8,
@@ -1052,7 +1448,99 @@ def _self_test():
     print("  invalid settings rejected")
 
     print("=" * 70)
-    print("TEST 10: rank deficiency is reported")
+    print("TEST 11: Durbin-Watson, as a statistic and as a stopping rule")
+    assert 1.5 < durbin_watson(rng.randn(400)) < 2.5
+    assert durbin_watson(np.sin(np.linspace(0, 3, 200))) < 0.01
+    assert durbin_watson(np.array([1.0, -1.0] * 100)) > 3.5
+    assert not np.isfinite(durbin_watson([1.0]))
+    assert not np.isfinite(durbin_watson(np.zeros(10)))
+    assert np.isfinite(cdr.durbin_watson) and np.isfinite(joint.durbin_watson)
+
+    # A generous sigma: chi2_red passes below 1 while the residuals still arc.
+    t_g = np.logspace(-5, -1, 55)
+    g_g = log_taufactor_grid(1.0, 1.0e5, 115)
+    A_g = build_basis(t_g, g_g, t_units="s")
+    tr_g = np.zeros(g_g.size + 1)
+    for _tf, _a in ((60.0, 0.018), (200.0, 0.014), (900.0, 0.010),
+                    (4000.0, 0.005)):
+        tr_g[int(np.argmin(np.abs(g_g - _tf)))] = _a
+    tr_g[-1] = -0.0003
+    G_g = A_g.dot(tr_g) + 0.0006 * rng.randn(t_g.size)
+    s_g = 0.0006 * 2.2 * np.ones(t_g.size)
+    m_g = basis_nonneg_mask(g_g.size)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        by_chi2 = solve_coordinate_descent(G_g, A_g, sigma=s_g, nonneg=m_g)
+        by_dw = solve_coordinate_descent(G_g, A_g, sigma=s_g, nonneg=m_g,
+                                         target_chi2_red=0.0, min_dchi2=0.0,
+                                         target_dw=1.8, max_iter=400)
+    print("  chi2 rule : %2d rounds, %2d columns, chi2_red %.3f, DW %.3f"
+          % (by_chi2.n_iter, by_chi2.n_free, by_chi2.chi2_red,
+             by_chi2.durbin_watson))
+    print("  DW rule   : %2d rounds, %2d columns, chi2_red %.3f, DW %.3f"
+          % (by_dw.n_iter, by_dw.n_free, by_dw.chi2_red, by_dw.durbin_watson))
+    assert by_chi2.durbin_watson < 1.0, "the chi2 rule should stop early here"
+    assert by_dw.durbin_watson >= 1.8, "the DW rule must reach its target"
+    assert by_dw.n_free > by_chi2.n_free
+    assert by_dw.converged
+
+    # An unreachable target must hit the cap and say so, not spin forever.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        greedy_dw = solve_coordinate_descent(G_g, A_g, sigma=s_g, nonneg=m_g,
+                                             target_chi2_red=0.0, min_dchi2=0.0,
+                                             target_dw=3.9, max_iter=25)
+    assert greedy_dw.n_iter == 25 and not greedy_dw.converged
+    print("  unreachable target: capped at %d rounds, converged=%s"
+          % (greedy_dw.n_iter, greedy_dw.converged))
+
+    # 0 disables rather than stopping instantly.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        off = solve_coordinate_descent(G_g, A_g, sigma=s_g, nonneg=m_g,
+                                       target_dw=0.0)
+    assert off.n_iter == by_chi2.n_iter, "target_dw=0 must change nothing"
+    try:
+        solve_coordinate_descent(G_g, A_g, sigma=s_g, target_dw=-1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for a negative target_dw")
+    print("  0 disables it; negative rejected")
+
+    print("=" * 70)
+    print("TEST 12: column coherence")
+    ident = np.array([[1.0, 1.0, 0.0], [0.0, 1e-9, 1.0]])
+    c = column_coherence(ident)
+    assert np.isclose(c["max"], 1.0, atol=1e-8) and c["pair"] == (0, 1)
+    orth = np.eye(3)
+    assert column_coherence(orth)["max"] < 1e-12
+    cg = column_coherence(ident, groups=["a", "b", "b"])
+    assert np.isclose(cg["cross_max"], 1.0, atol=1e-8)
+    assert cg["cross_pair"] == (0, 1)
+    # groups that put the near-identical pair together must push cross_max down
+    cg2 = column_coherence(ident, groups=["a", "a", "b"])
+    assert cg2["cross_max"] < 0.5, cg2["cross_max"]
+    # degenerate inputs return NaN rather than raising
+    assert not np.isfinite(column_coherence(np.ones((3, 1)))["max"])
+    assert not np.isfinite(column_coherence(np.zeros((3, 4)))["max"])
+    try:
+        column_coherence(ident, groups=["a"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError on a groups/columns mismatch")
+    # On a real basis, neighbouring columns are nearly parallel; the diagnostic
+    # names which pair, where cond only says the basis as a whole is bad.
+    A_fine = build_basis(t5, log_taufactor_grid(10.0, 1e4, 40), t_units="s",
+                         include_baseline=False)
+    cf = column_coherence(A_fine)
+    print("  fine grid: worst pair %s at coherence %.6f"
+          % (cf["pair"], cf["max"]))
+    assert cf["max"] > 0.99 and abs(cf["pair"][0] - cf["pair"][1]) == 1
+
+    print("=" * 70)
+    print("TEST 13: rank deficiency is reported")
     A_dup = np.hstack([A5, A5[:, [0]]])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1061,7 +1549,7 @@ def _self_test():
     assert r8.rank == 4
 
     print("=" * 70)
-    print("TEST 11: masking and input validation")
+    print("TEST 14: masking and input validation")
     Gm, Am, sm = apply_mask(G5, A5, s5, t5 > 1e-5)
     assert Gm.size == Am.shape[0] == sm.size == int(np.sum(t5 > 1e-5))
     for bad in (

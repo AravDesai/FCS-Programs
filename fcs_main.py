@@ -98,17 +98,6 @@ def _active_data() -> FCSData | None:
         return workspace[active_key]
     return None
 
-
-#def _file_summary(d: FCSData) -> str:
-#    return (
-#        f"{d.filepath.name}\n"
-#        f"  Duration : {d.duration_s:.2f} s\n"
-#        f"  Ch1      : {len(d.ch1_deltas):,} photons  "
-#        f"({d.count_rate_ch1_hz:,.0f} CPS)\n"
-#        f"  Ch2      : {len(d.ch2_deltas):,} photons  "
-#        f"({d.count_rate_ch2_hz:,.0f} CPS)"
-#    )
-
 def _file_summary(d) -> str:
     # Lifetime-decay datasets (.ifx) carry no photon-record fields; summarise
     # them by their decay/IRF shape instead.
@@ -170,7 +159,6 @@ def status_refresh():
 def ws_add():
     paths = filedialog.askopenfilenames(
         title="Add FCS files to workspace",
-        #filetypes=[("FCS data files", "*.fcs"), ("All files", "*.*")],
         filetypes=[("All files", "*.*"), ("FCS data files", "*.fcs")],
     )
     if not paths:

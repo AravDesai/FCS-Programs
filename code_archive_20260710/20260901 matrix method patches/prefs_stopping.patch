@@ -1,0 +1,96 @@
+--- a/fcs_prefs.py	2026-09-02 15:14:28.360567311 +0000
++++ b/fcs_prefs.py	2026-09-02 15:23:24.565341603 +0000
+@@ -118,6 +118,93 @@
+         help="Reference for the Normalize checkbox: mean of the first "
+              "k plotted points.",
+     ),
++    Pref(
++        key="linsolve_taufactor_min",
++        label="Shortest taufactor",
++        section="Linear decomposition",
++        kind="float",
++        default=1.0e0,
++        target=("fcs_linsolve", "_TAUFACTOR_MIN"),
++        lo=1e-3, hi=1e9,
++        help="taufactor 1 is a characteristic lag time of 1 microsecond.",
++    ),
++    Pref(
++        key="linsolve_taufactor_max",
++        label="Longest taufactor",
++        section="Linear decomposition",
++        kind="float",
++        default=1.0e3,
++        target=("fcs_linsolve", "_TAUFACTOR_MAX"),
++        lo=1e-3, hi=1e9,
++        help="Must exceed the shortest taufactor; 1e3 is 1 millisecond.",
++    ),
++    Pref(
++        key="linsolve_per_decade",
++        label="Basis vectors per decade",
++        section="Linear decomposition",
++        kind="int",
++        default=20,
++        target=("fcs_linsolve", "_TAUFACTOR_PER_DECADE"),
++        lo=1, hi=200,
++        help="Spacing is set per decade, so widening the span above does "
++             "not coarsen the grid.",
++    ),
++    Pref(
++        key="linsolve_cd_target_chi2_red",
++        label="Stop at chi2/dof",
++        section="Matrix method stopping",
++        kind="float",
++        default=1.0,
++        target=("fcs_linsolve", "_CD_TARGET_CHI2_RED"),
++        lo=0.0, hi=1e6,
++        help="0 switches this off. It trusts G_std to be a fair estimate of "
++             "the scatter; a generous G_std stops the search while the "
++             "residuals still show structure.",
++    ),
++    Pref(
++        key="linsolve_cd_min_dchi2",
++        label="Minimum chi2 improvement",
++        section="Matrix method stopping",
++        kind="float",
++        default=1.0,
++        target=("fcs_linsolve", "_CD_MIN_DCHI2"),
++        lo=0.0, hi=1e6,
++        help="A round buying less than this counts as stalled. Lower it to "
++             "keep adding components until the residuals are structureless.",
++    ),
++    Pref(
++        key="linsolve_cd_patience",
++        label="Stalled rounds allowed",
++        section="Matrix method stopping",
++        kind="int",
++        default=3,
++        target=("fcs_linsolve", "_CD_PATIENCE"),
++        lo=1, hi=100,
++        help="The improvement sequence is not monotonic, so one small round "
++             "is not evidence of having arrived.",
++    ),
++    Pref(
++        key="linsolve_cd_target_dw",
++        label="Stop at Durbin-Watson",
++        section="Matrix method stopping",
++        kind="float",
++        default=0.0,
++        target=("fcs_linsolve", "_CD_TARGET_DW"),
++        lo=0.0, hi=4.0,
++        help="0 switches this off. Around 1.8 keeps fitting until the "
++             "residuals have no structure left, which does not rely on G_std "
++             "being a fair error estimate the way chi2/dof does.",
++    ),
++    Pref(
++        key="linsolve_cd_max_iter",
++        label="Maximum rounds",
++        section="Matrix method stopping",
++        kind="int",
++        default=500,
++        target=("fcs_linsolve", "_CD_MAX_ITER"),
++        lo=1, hi=100000,
++        help="Hard cap. A fit that hits it is reported as not converged.",
++    ),
+ ]
+ 
+ 

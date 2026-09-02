@@ -1,0 +1,195 @@
+--- a/fcs_fitcommon.py	2026-09-02 15:35:09.570866252 +0000
++++ b/fcs_fitcommon.py	2026-09-02 15:35:22.497340804 +0000
+@@ -271,6 +271,143 @@
+     return csv_path, written
+ 
+ 
++# ── Dialog windows ────────────────────────────────────────────────────────────
++#
++# Every dialog in the suite should be resizable and should scroll, because
++# neither is optional in practice: a settings window grows an entry at a time
++# until it is taller than a laptop screen, and a fixed-size window then puts its
++# OK button somewhere the user cannot reach.  The matrix-method setup window hit
++# exactly that at 1031 pixels tall.
++#
++# tkinter has no scrollable frame, so it is built the usual way: a Canvas with a
++# Frame inside it, the Canvas scrolled by a Scrollbar.  The buttons are packed
++# OUTSIDE the scrolling area so they stay put no matter how far the body
++# scrolls -- a scrollbar alone would still let someone lose the OK button off
++# the bottom.
++#
++# tkinter is imported inside these functions, not at module scope, for the same
++# reason write_params_table imports fcs_export inside its body: the module's
++# import graph stays free of GUI dependencies, and a headless caller that never
++# opens a dialog never pays for one.
++
++
++def scrollable_dialog(parent=None, title="", modal=True):
++    """Create a resizable Toplevel whose body scrolls vertically.
++
++    Returns
++    -------
++    (win, body, buttons)
++        ``win``     the Toplevel.
++        ``body``    pack content in here; it scrolls.
++        ``buttons`` pinned to the bottom, always visible.
++
++    Call :func:`fit_dialog_to_screen` once the body is filled, then
++    ``win.wait_window()`` as usual.
++    """
++    import tkinter as tk
++
++    win = tk.Toplevel(parent) if parent is not None else tk.Toplevel()
++    win.title(title)
++    win.resizable(True, True)
++    if modal:
++        try:
++            win.grab_set()
++        except Exception:      # noqa: BLE001 - a dialog that cannot grab is
++            pass               # still a usable dialog
++
++    # Buttons first: packing them to the bottom BEFORE the expanding body is
++    # what reserves their space, so they are never squeezed out.
++    buttons = tk.Frame(win)
++    buttons.pack(side="bottom", fill="x")
++
++    outer = tk.Frame(win)
++    outer.pack(side="top", fill="both", expand=True)
++    canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
++    vbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
++    canvas.configure(yscrollcommand=vbar.set)
++    vbar.pack(side="right", fill="y")
++    canvas.pack(side="left", fill="both", expand=True)
++
++    body = tk.Frame(canvas)
++    body_id = canvas.create_window((0, 0), window=body, anchor="nw")
++
++    def _body_resized(_event=None):
++        canvas.configure(scrollregion=canvas.bbox("all"))
++
++    def _canvas_resized(event):
++        # Keep the body as wide as the canvas so content stretches instead of
++        # leaving a dead strip beside the scrollbar.
++        canvas.itemconfigure(body_id, width=event.width)
++
++    body.bind("<Configure>", _body_resized)
++    canvas.bind("<Configure>", _canvas_resized)
++
++    def _wheel(event):
++        if getattr(event, "num", None) == 4:
++            step = -1
++        elif getattr(event, "num", None) == 5:
++            step = 1
++        else:
++            step = -1 if getattr(event, "delta", 0) > 0 else 1
++        canvas.yview_scroll(step, "units")
++
++    _SEQS = ("<MouseWheel>", "<Button-4>", "<Button-5>")
++
++    def _grab_wheel(_event=None):
++        for seq in _SEQS:
++            canvas.bind_all(seq, _wheel)
++
++    def _release_wheel(_event=None):
++        for seq in _SEQS:
++            try:
++                canvas.unbind_all(seq)
++            except Exception:          # noqa: BLE001 - teardown must not raise
++                pass
++
++    # Bound only while the pointer is over this window, and released again on
++    # destroy, so a dialog cannot leave a global binding behind that scrolls it
++    # after it has closed.
++    win.bind("<Enter>", _grab_wheel)
++    win.bind("<Leave>", _release_wheel)
++    win.bind("<Destroy>",
++             lambda e: _release_wheel() if e.widget is win else None)
++
++    win._scroll_canvas = canvas          # read by fit_dialog_to_screen
++    win._scroll_body = body
++    return win, body, buttons
++
++
++def fit_dialog_to_screen(win, max_fraction=0.85, min_width=360,
++                         min_height=200):
++    """Size *win* to its content, capped at a fraction of the screen.
++
++    A window taller than the screen is the failure this exists to prevent, so
++    the cap is the point: past it the body scrolls instead of growing.  The
++    window is then centred horizontally and placed a third of the way down,
++    which keeps it clear of a taskbar at the bottom.
++    """
++    win.update_idletasks()
++
++    body = getattr(win, "_scroll_body", None)
++    canvas = getattr(win, "_scroll_canvas", None)
++    if body is not None and canvas is not None:
++        # A Canvas has no natural size, so ask it for the body's.
++        canvas.configure(width=body.winfo_reqwidth(),
++                         height=body.winfo_reqheight())
++        win.update_idletasks()
++
++    want_w = max(win.winfo_reqwidth(), min_width)
++    want_h = max(win.winfo_reqheight(), min_height)
++    screen_w, screen_h = win.winfo_screenwidth(), win.winfo_screenheight()
++    w = min(want_w, int(screen_w * max_fraction))
++    h = min(want_h, int(screen_h * max_fraction))
++
++    win.geometry("%dx%d+%d+%d" % (w, h, max((screen_w - w) // 2, 0),
++                                  max((screen_h - h) // 3, 0)))
++    win.minsize(min(min_width, w), min(min_height, h))
++    return w, h
++
++
+ # ── Self-test ─────────────────────────────────────────────────────────────────
+ 
+ def _selftest() -> None:
+@@ -365,6 +502,48 @@
+     assert params_cell("Ch1") == "Ch1"
+     assert params_cell('say "hi"') == '"say ""hi"""'
+ 
++    # scrollable_dialog / fit_dialog_to_screen, when a display is available
++    try:
++        import tkinter as tk
++        root = tk.Tk()
++    except Exception as exc:               # noqa: BLE001
++        print("  no display (%s); skipped the dialog checks"
++              % type(exc).__name__)
++    else:
++        root.withdraw()
++        try:
++            win, body, buttons = scrollable_dialog(root, "test", modal=False)
++            for i in range(60):            # taller than any screen
++                tk.Label(body, text="row %d" % i).pack(fill="x")
++            tk.Button(buttons, text="OK").pack()
++            w, h = fit_dialog_to_screen(win)
++            win.update_idletasks()
++
++            assert win.resizable() == (True, True), "dialog must be resizable"
++            sh = win.winfo_screenheight()
++            assert h <= int(sh * 0.85) + 1, "height must be capped: %d" % h
++
++            canvas = win._scroll_canvas
++            region = [float(v) for v in canvas.cget("scrollregion").split()]
++            assert region[3] > canvas.winfo_height(), \
++                "the body must overflow, or nothing is being scrolled"
++            bars = [c for c in canvas.master.winfo_children()
++                    if c.winfo_class() == "Scrollbar"]
++            assert len(bars) == 1, "expected one scrollbar"
++
++            # Buttons live outside the scrolling area, so scrolling to the
++            # bottom cannot take them with it.
++            assert buttons.master is win
++            assert buttons not in canvas.winfo_children()
++            canvas.yview_moveto(1.0)
++            win.update_idletasks()
++            assert buttons.winfo_ismapped(), "buttons must stay visible"
++            print("  scrollable dialog: %dx%d, capped from %d, scrollbar "
++                  "present, buttons pinned" % (w, h, win.winfo_reqheight()))
++            win.destroy()
++        finally:
++            root.destroy()
++
+     print("fcs_fitcommon: all self-tests passed.")
+ 
+ 

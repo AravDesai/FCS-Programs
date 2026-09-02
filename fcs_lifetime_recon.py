@@ -53,6 +53,7 @@ from fcs_lifetime_models import LifetimeModel
 from fcs_ifx import LifetimeData
 
 import fcs_export
+import fcs_fisher
 
 from fcs_fitcommon import (
     fits_dir as _fits_dir,
@@ -256,7 +257,36 @@ def fit_lifetime(
 
     Returns a result dict with fitted values, 1σ errors, the data, the fitted
     curve, residuals and goodness-of-fit statistics, plus derived lifetime
-    quantities (fractional contributions and mean lifetimes).
+    quantities (fractional contributions and mean lifetimes).  The free-
+    parameter covariance is returned as ``pcov`` (None if it could not be
+    formed), which is what feeds the report's Fisher-information section.
+
+    Which uncertainty convention
+    ----------------------------
+    A weighted fit reports the INTERNAL (a priori) error: the covariance is
+    ``pinv(J^T J)`` with J the Jacobian of the ALREADY-WEIGHTED residuals, so
+    it is in absolute units and needs no further scaling.  This is right here
+    because Poisson sigma = sqrt(N) is a KNOWN absolute error, derived from the
+    statistics of photon detection rather than estimated from the data -- there
+    is no unknown noise scale to recover.  It is also the convention
+    fcs_lifetime_fit and fcs_pch_fit get from ``curve_fit(absolute_sigma=True)``
+    and fcs_globalfit applies explicitly, so all four fitters agree.
+
+    An unweighted fit reports the EXTERNAL (a posteriori) error: sigma is all
+    ones, carrying no absolute scale, so the covariance is multiplied by the
+    residual variance chi2/dof.  That factor -- the square of the Birge ratio
+    -- is the only honest source of scale when none was supplied.
+
+    This function previously applied the external scaling UNCONDITIONALLY, so a
+    weighted fit reported errors a factor sqrt(red. chi^2) too large (or too
+    small, when red. chi^2 < 1, which claims a precision better than the
+    Cramer-Rao bound).  Worse, it made red. chi^2 useless as a model-adequacy
+    test: rescaling forces the errors to be consistent with red. chi^2 = 1 by
+    construction, so a mono-exponential fit to a bi-exponential decay quietly
+    widened its error bars instead of announcing that the model was wrong.
+    Older reports can be corrected without refitting by dividing each std err
+    by sqrt(red. chi^2) from the same report; the fitted VALUES were never
+    affected.
     """
     names = model.param_names()
     t = np.asarray(t_ns, dtype=np.float64)
@@ -315,9 +345,11 @@ def fit_lifetime(
     )
 
     # 1σ errors from the Jacobian (Gauss–Newton covariance approximation).
+    # Internal errors when weighted, external when not -- see the docstring.
     values = dict(fixed_vals)
     errors = {n: 0.0 for n in fixed_vals}
-    perr = _jacobian_errors(sol, int(fit_mask.sum()), len(free))
+    pcov, perr = _jacobian_errors(sol, int(fit_mask.sum()), len(free),
+                                  weighted=weighted)
     for n, v, e in zip(free, sol.x, perr):
         values[n] = float(v)
         errors[n] = float(e)
@@ -354,23 +386,50 @@ def fit_lifetime(
         "r2": r2, "chi2": chi2, "red_chi2": red_chi2,
         "ss_res": ss_res, "n_points": int(fit_mask.sum()), "dof": dof,
         "weighted": weighted, "has_irf": has_irf,
+        # Free-parameter covariance, for the report's Fisher section.  None
+        # when the Jacobian step failed, which fcs_fisher reports as a reason
+        # rather than raising.
+        "pcov": pcov,
+        # Which uncertainty convention the errors above follow, so a report
+        # states it rather than leaving the reader to infer it.
+        "error_convention": "internal" if weighted else "external",
         "derived": derived,
     }
 
 
-def _jacobian_errors(sol, n_points: int, n_free: int) -> np.ndarray:
-    """1σ parameter errors from the least_squares Jacobian at the solution."""
+def _jacobian_errors(sol, n_points: int, n_free: int,
+                     weighted: bool = False):
+    """
+    Free-parameter covariance and 1σ errors from the least_squares Jacobian.
+
+    Returns ``(cov, perr)``; ``cov`` is None when the Jacobian step failed, in
+    which case ``perr`` is all-NaN and the caller's Fisher section says why.
+
+    ``sol.jac`` is the Jacobian of the residuals AS RETURNED, and _residuals
+    already divides by sigma, so J[i, p] = (1/sigma_i) * df(t_i)/dtheta_p and
+    ``J^T J`` is the weighted normal matrix -- the Fisher information for
+    Gaussian errors of known size.  Its inverse is therefore already the
+    covariance in absolute units when sigma is a real absolute error.
+
+    Scaling by chi2/dof on top of that is the EXTERNAL (a posteriori)
+    convention, whose square root is the Birge ratio.  It is correct only when
+    sigma carries no absolute scale, which for this fitter means the unweighted
+    case, where sigma is all ones and the residual variance is the only
+    estimate of the noise available.  Applying it to a Poisson-weighted fit
+    double-counts a scale that sqrt(N) already set.
+
+    Same arithmetic and same gate as fcs_globalfit.fit_linked, which computes
+    the identical factor as ``2.0 * sol.cost / dof``.
+    """
     try:
         J = sol.jac
-        # Reduced χ² of the (already weighted) residuals scales the covariance.
-        dof = max(n_points - n_free, 1)
-        resid = sol.fun
-        s_sq = float(np.sum(resid ** 2)) / dof
-        JTJ = J.T @ J
-        cov = np.linalg.pinv(JTJ) * s_sq
-        return np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        cov = np.linalg.pinv(J.T @ J)
+        if not weighted:
+            dof = max(n_points - n_free, 1)
+            cov = cov * (float(np.sum(sol.fun ** 2)) / dof)
+        return cov, np.sqrt(np.clip(np.diag(cov), 0.0, None))
     except Exception:
-        return np.full(n_free, np.nan)
+        return None, np.full(n_free, np.nan)
 
 
 def _derived_lifetimes(model: LifetimeModel, values: Dict[str, float]) -> dict:
@@ -618,6 +677,28 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     L.append(f"  R^2        : {result['r2']:.6f}")
     L.append(f"  chi^2      : {result['chi2']:.6g}")
     L.append(f"  red. chi^2 : {result['red_chi2']:.6g}")
+    # Which uncertainty convention the std errs above follow.  Stated, not
+    # implied: the two differ by the Birge ratio sqrt(red. chi^2), so a report
+    # that does not say which one it used cannot be compared with another.
+    if result["weighted"]:
+        L.append("  errors     : internal (a priori) -- covariance from the "
+                 "Poisson-weighted")
+        L.append("               Jacobian, in absolute units; NOT rescaled by "
+                 "red. chi^2,")
+        L.append("               so red. chi^2 remains a valid test of model "
+                 "adequacy.")
+    else:
+        L.append("  errors     : external (a posteriori) -- covariance scaled "
+                 "by the residual")
+        L.append("               variance chi^2/dof, since an unweighted fit "
+                 "supplies no")
+        L.append("               absolute sigma.  red. chi^2 is 1 by "
+                 "construction here.")
+    L.append("")
+
+    L.extend(fcs_fisher.format_report_lines(
+        fcs_fisher.fisher_from_covariance(
+            result.get("pcov"), result["free"], result["weighted"])))
     L.append("")
     report_path.write_text("\n".join(L), encoding="utf-8")
 
@@ -704,6 +785,14 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
     comments.append("units : tau and shift in ns, fit window in ns")
     comments.append("note_fixed : blank *_err means the parameter was held fixed")
+    comments.append(
+        "note_errors : "
+        + ("internal (a priori) 1-sigma - covariance from the Poisson-weighted "
+           "Jacobian, in absolute units, not rescaled by red. chi^2"
+           if result["weighted"] else
+           "external (a posteriori) 1-sigma - covariance scaled by the "
+           "residual variance chi^2/dof, as an unweighted fit supplies no "
+           "absolute sigma"))
     if model.n_exp > 1:
         comments.append("note_alpha : alpha_i = a_i / sum(a) - amplitude "
                         "fraction (fraction of molecules)")

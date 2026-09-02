@@ -55,6 +55,26 @@ def _load(data: DataOrPath) -> FCSData:
     return read_fcs(data)
 
 
+def _recorded_channels(d) -> tuple:
+    """
+    Which detector channels *d* actually RECORDED: (1,), (2,) or (1, 2).
+
+    Reads the reader's ``channels`` attribute, defaulting to both for any
+    object that predates it -- the same contract fcs_lifetime._resolve_channels
+    and fcs_corr.supported_corr_types work from.
+
+    This module needs it because ``bin_intensity`` cannot express the
+    difference on its own: an absent channel has an empty photon array, and
+    binning an empty array gives a trace of zeros -- which is also exactly what
+    a dual-channel acquisition with a dead detector gives.  FCSData.channels is
+    deliberate about keeping those two apart (whether a silent detector means a
+    broken PMT or an empty sample is the user's judgement, not the parser's),
+    and the intensity plot should not merge them back together by drawing a
+    flat line at zero and calling it Ch2.
+    """
+    return tuple(getattr(d, "channels", (1, 2)))
+
+
 def _choose_bin_width(duration_s: float) -> float:
     """
     Choose a sensible default bin width based on the measurement duration.
@@ -111,7 +131,8 @@ _DEFAULT_BIN_WIDTH_LABEL = "100 ms"
 
 def _draw_intensity(ax, time_s, I1_cps, I2_cps,
                     mean_cps_ch1: float, mean_cps_ch2: float,
-                    source_name: str, bin_width_s: float) -> None:
+                    source_name: str, bin_width_s: float,
+                    channels: tuple = (1, 2)) -> None:
     """
     Draw one intensity trace onto *ax*, given the already-binned arrays.
 
@@ -124,24 +145,49 @@ def _draw_intensity(ax, time_s, I1_cps, I2_cps,
     Everything here is presentation: the axis limits, the legend corner chosen
     to avoid the data, the mean-CPS rows folded into the legend box.  Nothing
     is computed from photon records, which is why a CSV is enough to redraw it.
+
+    *channels* is the tuple of channels the acquisition RECORDED.  Only those
+    are drawn, and only those contribute to the axis limits, the legend-corner
+    choice and the mean-CPS rows.  It defaults to both, so a caller with no
+    channel information behaves exactly as this function always has.
     """
-    ax.plot(time_s, I1_cps, color="steelblue", linewidth=0.8,
-            label="Ch1", alpha=0.9)
-    ax.plot(time_s, I2_cps, color="tomato", linewidth=0.8,
-            label="Ch2", alpha=0.9)
+    # One record per channel actually recorded, built once and reused for the
+    # traces, the limits, the legend corner and the legend rows -- so a channel
+    # can never be drawn but left out of the scaling, or scaled but not drawn.
+    series = [
+        (ch, trace, colour, mean)
+        for ch, trace, colour, mean in (
+            (1, I1_cps, "steelblue", mean_cps_ch1),
+            (2, I2_cps, "tomato",    mean_cps_ch2),
+        )
+        if ch in channels
+    ]
+    if not series:
+        raise ValueError(
+            f"No recorded channels to draw (channels={tuple(channels)!r}); "
+            f"there is nothing to plot for {source_name}.")
+
+    for ch, trace, colour, _mean in series:
+        ax.plot(time_s, trace, color=colour, linewidth=0.8,
+                label=f"Ch{ch}", alpha=0.9)
 
     ax.set_xlabel("Time (s)", fontsize=12)
     ax.set_ylabel("Intensity (CPS)", fontsize=12)
 
     title = f"Intensity trace — {source_name}"
     subtitle = f"Bin width: {_format_bin_width(bin_width_s)}"
+    if len(series) < 2:
+        # Say it on the figure, not just by the absence of a line: a
+        # single-channel trace and a dual-channel one with a dead detector look
+        # identical once plotted, and the figure is what gets saved.
+        subtitle += f"  ·  Ch{series[0][0]} only (single-channel acquisition)"
     ax.set_title(f"{title}\n{subtitle}", fontsize=11)
 
     # ── Y-axis limits ─────────────────────────────────────────────────────────
     # Lower limit is always zero.  Upper limit is 1.25× the 99th percentile
     # of the combined channels, so bright transient bursts don't compress the
     # rest of the trace toward the top of the plot.
-    combined_cps = np.concatenate([I1_cps, I2_cps])
+    combined_cps = np.concatenate([t for _ch, t, _c, _m in series])
     y_upper = np.percentile(combined_cps, 99) * 1.25
     y_upper = max(y_upper, 1.0)   # guard against near-zero data
     ax.set_ylim(0, y_upper)
@@ -157,8 +203,8 @@ def _draw_intensity(ax, time_s, I1_cps, I2_cps,
     # Determine the best corner: pick the quadrant with the lowest mean
     # intensity so the legend is least likely to overlap data.
     n = len(time_s)
-    left_mean  = np.mean(np.concatenate([I1_cps[:n//2], I2_cps[:n//2]]))
-    right_mean = np.mean(np.concatenate([I1_cps[n//2:], I2_cps[n//2:]]))
+    left_mean  = np.mean(np.concatenate([t[:n//2] for _ch, t, _c, _m in series]))
+    right_mean = np.mean(np.concatenate([t[n//2:] for _ch, t, _c, _m in series]))
     upper_band = combined_cps[combined_cps > 0.6 * y_upper]
     use_top    = len(upper_band) < 0.15 * len(combined_cps)
     use_left   = left_mean <= right_mean
@@ -167,15 +213,18 @@ def _draw_intensity(ax, time_s, I1_cps, I2_cps,
     y_loc = "upper" if use_top  else "lower"
     loc   = f"{y_loc} {x_loc}"
 
-    # Build legend handles: two real channel lines + spacer + two text rows
-    ch1_handle     = plt.Line2D([0], [0], color="steelblue", linewidth=1.5, label="Ch1")
-    ch2_handle     = plt.Line2D([0], [0], color="tomato",    linewidth=1.5, label="Ch2")
-    spacer         = Patch(alpha=0, label="─────────────")
-    mean_ch1_label = Patch(alpha=0, label=f"Mean Ch1: {mean_cps_ch1:,.0f} CPS")
-    mean_ch2_label = Patch(alpha=0, label=f"Mean Ch2: {mean_cps_ch2:,.0f} CPS")
+    # Build legend handles: one real line per recorded channel + spacer + one
+    # text row per recorded channel.  A "Mean Ch2: 0 CPS" row for a channel
+    # that was never recorded would state a measurement that was not made.
+    handles = [plt.Line2D([0], [0], color=colour, linewidth=1.5,
+                          label=f"Ch{ch}")
+               for ch, _t, colour, _m in series]
+    handles.append(Patch(alpha=0, label="─────────────"))
+    handles += [Patch(alpha=0, label=f"Mean Ch{ch}: {mean:,.0f} CPS")
+                for ch, _t, _c, mean in series]
 
     ax.legend(
-        handles=[ch1_handle, ch2_handle, spacer, mean_ch1_label, mean_ch2_label],
+        handles=handles,
         loc=loc,
         fontsize=10,
         framealpha=0.8,
@@ -188,6 +237,65 @@ def _draw_intensity(ax, time_s, I1_cps, I2_cps,
         lambda x, _: f"{x:,.0f}"    # comma-separated thousands in y axis
     ))
     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+
+
+# ── Export ────────────────────────────────────────────────────────────────────
+
+def _intensity_export(d, time_s, I1_counts, I2_counts,
+                      I1_cps, I2_cps, bin_width_s, channels) -> None:
+    """
+    Write one file's binned intensity trace to a CSV.
+
+    The schema is FIXED -- time_s, ch1_counts, ch2_counts, ch1_cps, ch2_cps,
+    always, in that order, whatever the file recorded -- so every intensity
+    export has the same header and can be read without inspecting it first.
+    This is the contract fcs_lifetime._lifetime_export_columns follows for the
+    decay exports.
+
+    A channel the acquisition never recorded gets a column of NaN rather than
+    the zeros bin_intensity returns for an empty photon list.  NaN is what
+    fcs_export.csv_value writes as a blank cell and what read_export maps a
+    blank cell back to, so it round-trips as "not measured"; a 0 would read
+    back as a genuine measurement of no light, which is what a dead detector
+    looks like and is a different claim.  Its ``chN_photons`` header field is
+    written blank for the same reason -- the convention fcs_corr._cps_meta
+    already follows.
+
+    ``channels_recorded`` names the channels the file actually had, so a reader
+    (rebuild_plot included) can tell a blank column that was never measured
+    from one that is blank for some other reason.
+
+    The single-file and overlay paths both call this.  They previously carried
+    a copy of this block each, which is the arrangement that lets two writers
+    of one format drift apart.
+    """
+    blank = np.full(len(time_s), np.nan, dtype=np.float64)
+
+    def _col(ch, arr):
+        if ch not in channels:
+            return blank.copy()
+        return np.asarray(arr, dtype=np.float64)
+
+    def _photons(ch, deltas):
+        return len(deltas) if ch in channels else ""
+
+    fcs_export.safe_export(
+        d, "intensity",
+        {
+            "time_s":     time_s,
+            "ch1_counts": _col(1, I1_counts),
+            "ch2_counts": _col(2, I2_counts),
+            "ch1_cps":    _col(1, I1_cps),
+            "ch2_cps":    _col(2, I2_cps),
+        },
+        meta={
+            "bin_width_s": f"{bin_width_s:.6g}",
+            "duration_s":  f"{d.duration_s:.6g}",
+            "ch1_photons": _photons(1, d.ch1_deltas),
+            "ch2_photons": _photons(2, d.ch2_deltas),
+            "channels_recorded": "+".join(f"Ch{c}" for c in channels),
+        },
+    )
 
 
 # ── Main plotting function ────────────────────────────────────────────────────
@@ -204,6 +312,10 @@ def plot_intensity(
     Ch1 and Ch2 are shown on the same axes.  The mean count rate (in counts
     per second, CPS) for each channel is displayed as an annotation on the
     plot.
+
+    Only the channels the acquisition recorded are drawn.  A single-channel
+    file plots its one trace and says so in the subtitle, rather than adding a
+    flat line at zero for a detector that was never there.
 
     Parameters
     ----------
@@ -227,6 +339,10 @@ def plot_intensity(
     # ── Load data ─────────────────────────────────────────────────────────────
     d = _load(data)
 
+    # Which channels this acquisition recorded.  Drives both the plot and the
+    # export, so the figure and the CSV cannot disagree about what was measured.
+    channels = _recorded_channels(d)
+
     # ── Choose bin width ──────────────────────────────────────────────────────
     if bin_width_s is None:
         bin_width_s = _choose_bin_width(d.duration_s)
@@ -240,22 +356,8 @@ def plot_intensity(
 
     # ── Optional CSV export of the plotted data ───────────────────────────────
     if export:
-        fcs_export.safe_export(
-            d, "intensity",
-            {
-                "time_s":     time_s,
-                "ch1_counts": I1_counts,
-                "ch2_counts": I2_counts,
-                "ch1_cps":    I1_cps,
-                "ch2_cps":    I2_cps,
-            },
-            meta={
-                "bin_width_s": f"{bin_width_s:.6g}",
-                "duration_s":  f"{d.duration_s:.6g}",
-                "ch1_photons": len(d.ch1_deltas),
-                "ch2_photons": len(d.ch2_deltas),
-            },
-        )
+        _intensity_export(d, time_s, I1_counts, I2_counts,
+                          I1_cps, I2_cps, bin_width_s, channels)
 
     # ── Mean count rates for the annotation ───────────────────────────────────
     # Use the true mean count rate from the FCSData object (computed from the
@@ -268,16 +370,12 @@ def plot_intensity(
     fig, ax = plt.subplots(figsize=(10, 4))
     _draw_intensity(ax, time_s, I1_cps, I2_cps,
                     mean_cps_ch1, mean_cps_ch2,
-                    d.filepath.name, bin_width_s)
+                    d.filepath.name, bin_width_s, channels=channels)
     fig.tight_layout()
 
     if show:
-        #plt.show was the static plot; now dynamic w/ fcs_plottools
-        #plt.show()
         fcs_plottools.show_figure(fig, ax)
-
     return fig, ax
-
 
 # ── Reopening an exported trace ───────────────────────────────────────────────
 
@@ -296,6 +394,12 @@ def rebuild_plot(meta, columns, show: bool = True, path=None):
     exactly rather than being approximated from the binned trace.  The trace
     mean is only a fallback, for an export written before those keys existed:
     it differs slightly because the last bin is usually a partial one.
+
+    Recovering the channels
+    -----------------------
+    ``channels_recorded`` says which channels the acquisition had.  Exports
+    written before that key existed fall back to whichever columns hold a
+    finite value -- see :func:`_channels_from_meta`.
 
     Overlay exports need no special handling.  ``plot_intensity_overlay``
     writes one CSV per file, in the same schema as the single-file path, so a
@@ -318,16 +422,22 @@ def rebuild_plot(meta, columns, show: bool = True, path=None):
 
     def _cps(ch: str) -> np.ndarray:
         if f"{ch}_cps" in columns:
-            return np.nan_to_num(np.asarray(columns[f"{ch}_cps"],
-                                            dtype=np.float64))
+            return np.asarray(columns[f"{ch}_cps"], dtype=np.float64)
         if f"{ch}_counts" in columns:
-            return np.nan_to_num(np.asarray(columns[f"{ch}_counts"],
-                                            dtype=np.float64)) / bin_width_s
+            return (np.asarray(columns[f"{ch}_counts"], dtype=np.float64)
+                    / bin_width_s)
         raise ValueError(
             f"This intensity export has neither '{ch}_cps' nor "
             f"'{ch}_counts', so the {ch.upper()} trace cannot be drawn.")
 
-    I1_cps, I2_cps = _cps("ch1"), _cps("ch2")
+    # The channel decision is made on the RAW columns, before nan_to_num: an
+    # all-blank column is how a never-recorded channel reads back, and zeroing
+    # it first would erase exactly the evidence needed to recognise it.
+    raw1, raw2 = _cps("ch1"), _cps("ch2")
+    channels = _channels_from_meta(meta, {1: raw1, 2: raw2})
+    # Within a RECORDED channel a NaN is a gap in the trace, not an absent
+    # channel, so it is still zeroed for drawing, exactly as before.
+    I1_cps, I2_cps = np.nan_to_num(raw1), np.nan_to_num(raw2)
 
     duration = _meta_float(meta, "duration_s")
 
@@ -344,11 +454,32 @@ def rebuild_plot(meta, columns, show: bool = True, path=None):
     fig, ax = plt.subplots(figsize=(10, 4))
     _draw_intensity(ax, time_s, I1_cps, I2_cps,
                     _mean("ch1", I1_cps), _mean("ch2", I2_cps),
-                    source_name, bin_width_s)
+                    source_name, bin_width_s, channels=channels)
     fig.tight_layout()
     if show:
         fcs_plottools.show_figure(fig, ax)
     return fig, ax
+
+
+def _channels_from_meta(meta: dict, traces: dict) -> tuple:
+    """
+    Which channels an intensity export actually recorded.
+
+    Prefers the ``channels_recorded`` header.  Exports written before that key
+    existed lack it and fall back to whichever columns hold a finite value:
+    such a file wrote real zeros for an absent channel, so it will report both
+    -- which is what it claimed at the time, and reproducing a file's own claim
+    is the right behaviour when its convention cannot be recovered.  A column
+    that is entirely non-finite is dropped either way; it cannot be a
+    measurement.
+    """
+    raw = str(meta.get("channels_recorded") or "").strip()
+    if raw:
+        named = tuple(c for c in (1, 2) if f"Ch{c}" in raw)
+        if named:
+            return named
+    present = tuple(c for c in (1, 2) if np.isfinite(traces[c]).any())
+    return present or (1, 2)
 
 
 def _meta_float(meta: dict, key: str):
@@ -373,7 +504,12 @@ def plot_intensity_overlay(
     """
     Overlay intensity time traces from several files on one set of axes.
 
-    Each file is drawn in its own colour; Ch1 is solid and Ch2 dashed.  If
+    Each file is drawn in its own colour; Ch1 is solid and Ch2 dashed.
+    Channels are resolved PER FILE, so a mixed selection overlays a
+    single-channel file's one trace alongside a dual-channel file's two -- the
+    convention fcs_lifetime.plot_lifetime_overlay follows, and for the same
+    reason: each file is drawn and exported independently, so there is nothing
+    to reconcile across the selection.  If
     *bin_width_s* is None each file uses its own duration-based default,
     otherwise the same width is forced for all files.  When *export* is True
     each file's binned trace is written to its own CSV exactly as in the
@@ -405,39 +541,43 @@ def plot_intensity_overlay(
         I1_cps = I1_counts / bw
         I2_cps = I2_counts / bw
 
+        file_channels = _recorded_channels(d)
+
         # Legend row: "file   <Ch1 CPS>, <Ch2 CPS>".  Use the true mean count
         # rates (total photons / duration) for consistency with the single-file
-        # plot's legend, rather than the mean of the binned trace.
-        cps_label = (f"{d.filepath.name}   "
-                     f"{d.count_rate_ch1_hz:,.0f}, {d.count_rate_ch2_hz:,.0f}")
-        ax.plot(time_s, I1_cps, color=colour, linewidth=0.8, alpha=0.9,
-                label=cps_label)                  # Ch1 — solid, carries file label
-        ax.plot(time_s, I2_cps, color=colour, linewidth=0.8, alpha=0.55,
-                linestyle="--")                    # Ch2 — dashed, no extra legend row
+        # plot's legend, rather than the mean of the binned trace.  A channel
+        # the file never recorded gets an em dash: a "0" there would read as a
+        # detector that ran and saw nothing.
+        def _rate(ch, hz):
+            return f"{hz:,.0f}" if ch in file_channels else "—"
 
-        if len(time_s):
+        cps_label = (f"{d.filepath.name}   "
+                     f"{_rate(1, d.count_rate_ch1_hz)}, "
+                     f"{_rate(2, d.count_rate_ch2_hz)}")
+
+        # Ch1 solid, Ch2 dashed, as before.  The file's label rides on the
+        # FIRST line drawn for it, whichever channel that turns out to be -- a
+        # Ch2-only file has no Ch1 line to carry it, and its legend row must
+        # not go missing along with it.
+        drawn: list = []
+        for ch, trace, alpha, style in ((1, I1_cps, 0.9,  "-"),
+                                        (2, I2_cps, 0.55, "--")):
+            if ch not in file_channels:
+                continue
+            ax.plot(time_s, trace, color=colour, linewidth=0.8, alpha=alpha,
+                    linestyle=style,
+                    label=cps_label if not drawn else None)
+            drawn.append(trace)
+
+        if len(time_s) and drawn:
             t_max = max(t_max, float(time_s[-1]))
-            combined = np.concatenate([I1_cps, I2_cps])
+            combined = np.concatenate(drawn)
             if len(combined):
                 y_percentiles.append(float(np.percentile(combined, 99)))
 
         if export:
-            fcs_export.safe_export(
-                d, "intensity",
-                {
-                    "time_s":     time_s,
-                    "ch1_counts": I1_counts,
-                    "ch2_counts": I2_counts,
-                    "ch1_cps":    I1_cps,
-                    "ch2_cps":    I2_cps,
-                },
-                meta={
-                    "bin_width_s": f"{bw:.6g}",
-                    "duration_s":  f"{d.duration_s:.6g}",
-                    "ch1_photons": len(d.ch1_deltas),
-                    "ch2_photons": len(d.ch2_deltas),
-                },
-            )
+            _intensity_export(d, time_s, I1_counts, I2_counts,
+                              I1_cps, I2_cps, bw, file_channels)
 
     ax.set_xlabel("Time (s)", fontsize=12)
     ax.set_ylabel("Intensity (CPS)", fontsize=12)

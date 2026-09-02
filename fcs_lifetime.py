@@ -292,12 +292,6 @@ def plot_lifetime(
     """
     if n_bins not in _VALID_N_BINS:
         raise ValueError(f"n_bins must be one of {_VALID_N_BINS}; got {n_bins}.")
-
-    #d   = _load(data)
-    #fig, ax = plt.subplots(figsize=(9, 4))
-    #_draw_histogram(ax, d, n_bins, channels)
-    #fig.tight_layout()
-
     d   = _load(data)
 
     # ISS .ifx lifetime decay (already binned) → dedicated draw path; the

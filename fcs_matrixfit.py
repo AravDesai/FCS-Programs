@@ -62,15 +62,26 @@ import numpy as np
 import fcs_export
 import fcs_linsolve
 import fcs_plottools
-from fcs_fitcommon import new_fit_dir, slug_name, write_params_table
+from fcs_fitcommon import (fit_dialog_to_screen, new_fit_dir,
+                            scrollable_dialog, slug_name, write_params_table)
 
 
 # ── Module-level settings ─────────────────────────────────────────────────────
 
-# Characteristic lag time, in seconds, of the basis column at taufactor = 1.
-# This is the anchor the taufactor grid is expressed against; fcs_linsolve's
-# basis constants place the column's two component times either side of it.
-_TAUFACTOR_ANCHOR_S = 1.0e-6
+# When True, the matrix-method setup window prefills the taufactor span from
+# what the selected datasets' lag range actually supports, instead of from the
+# stored preference.  Off by default: the stored span is a deliberate choice
+# and should not be silently overridden.  Turning it on is the right default
+# for anyone who works across datasets with different lag windows, since the
+# supported span changes with every selection.
+_AUTO_TAUFACTOR_SPAN = False
+
+
+# The taufactor -> characteristic-time conversion belongs to the basis model,
+# not to this module.  Everything here asks fcs_linsolve for it, so swapping in
+# a generating function with a different anchor needs no change below.
+def _anchor(model=None):
+    return fcs_linsolve.get_basis_model(model).anchor_s
 
 # Lag times whose sigma is missing, zero or negative cannot be weighted and are
 # dropped from the fit.  Fewer than this many surviving points is not a fit.
@@ -99,7 +110,7 @@ def lag_range(datasets):
     return max(los), min(his)
 
 
-def span_check(taufactors, lag_lo_s, lag_hi_s):
+def span_check(taufactors, lag_lo_s, lag_hi_s, model=None):
     """How much of the taufactor grid falls outside what the lags can support.
 
     A basis vector whose characteristic time is far below the first lag has
@@ -116,7 +127,7 @@ def span_check(taufactors, lag_lo_s, lag_hi_s):
     span is fully supported).
     """
     tf = np.asarray(taufactors, dtype=float).ravel()
-    tau_c = tf * _TAUFACTOR_ANCHOR_S
+    tau_c = fcs_linsolve.characteristic_times(tf, model)
     if lag_lo_s is None or lag_hi_s is None:
         return {"n_fast": 0, "n_slow": 0, "n_total": tf.size, "message": ""}
 
@@ -139,11 +150,12 @@ def span_check(taufactors, lag_lo_s, lag_hi_s):
             "message": msg}
 
 
-def supported_taufactor_span(lag_lo_s, lag_hi_s):
+def supported_taufactor_span(lag_lo_s, lag_hi_s, model=None):
     """The taufactor span the measured lags do support, as (min, max)."""
     if lag_lo_s is None or lag_hi_s is None:
         return None, None
-    return lag_lo_s / _TAUFACTOR_ANCHOR_S, lag_hi_s / _TAUFACTOR_ANCHOR_S
+    a = _anchor(model)
+    return lag_lo_s / a, lag_hi_s / a
 
 
 # ── Sigma handling ────────────────────────────────────────────────────────────
@@ -199,7 +211,9 @@ def _meta_int(meta, key, default):
 
 def fit_dataset(ds, tf_min=None, tf_max=None, per_decade=None,
                 weighted=True, include_baseline=True, method="greedy",
-                max_iter=None, min_dchi2=None, polish=False):
+                max_iter=None, min_dchi2=None, polish=False,
+                basis_model=None, target_chi2_red=None, patience=None,
+                target_dw=None):
     """Decompose one correlation curve onto the basis.
 
     Parameters
@@ -220,9 +234,15 @@ def fit_dataset(ds, tf_min=None, tf_max=None, per_decade=None,
         columns against 65 lag points returns every column non-zero and a
         negative degrees of freedom.  "full" is the single joint bounded solve,
         appropriate for a coarse grid where the basis is not degenerate.
-    max_iter, min_dchi2, polish
+    max_iter, min_dchi2, patience, target_chi2_red, target_dw, polish
         Passed to fcs_linsolve.solve_coordinate_descent; ignored when
-        method="full".
+        method="full".  None means "use the module default" for each.  Set
+        target_chi2_red to 0 to switch that criterion off, which is what to do
+        when sigma is generous enough that chi2_red passes below 1 while the
+        residuals still run in systematic arcs.
+    basis_model : str, BasisModel or None
+        Generating function for the columns.  None uses the fcs_linsolve
+        default.  Nothing downstream depends on which one is chosen.
 
     Returns
     -------
@@ -256,19 +276,36 @@ def fit_dataset(ds, tf_min=None, tf_max=None, per_decade=None,
     G_k = G[keep]
     sig_k = None if sigma is None else sigma[keep]
 
+    # Durbin-Watson is computed on residuals in LAG ORDER, so the rows must be
+    # sorted before anything else happens.  Correlation CSVs are already
+    # ascending, which is why this is a guard rather than a routine step; if it
+    # ever fires, something upstream reordered the curve and the residual
+    # diagnostics would silently have been nonsense.
+    if np.any(np.diff(tau_k) < 0.0):
+        order = np.argsort(tau_k, kind="stable")
+        tau_k, G_k = tau_k[order], G_k[order]
+        if sig_k is not None:
+            sig_k = sig_k[order]
+        notes.append("lag times were not in ascending order and have been "
+                     "sorted; the residual structure statistic requires it")
+
     # ---- basis --------------------------------------------------------------
     grid = fcs_linsolve.log_taufactor_grid(tf_min, tf_max, per_decade)
     n_tau = grid.size
     # tau is in seconds: load_correlation_csv converts a tau_ms column on read,
     # so the units are known here and passed explicitly rather than defaulted.
+    mdl = fcs_linsolve.get_basis_model(basis_model)
     A = fcs_linsolve.build_basis(tau_k, grid, t_units="s",
-                                 include_baseline=include_baseline)
+                                 include_baseline=include_baseline,
+                                 model=mdl)
     mask = fcs_linsolve.basis_nonneg_mask(n_tau, include_baseline)
 
     if method == "greedy":
         result = fcs_linsolve.solve_coordinate_descent(
             G_k, A, sigma=sig_k, nonneg=mask, max_iter=max_iter,
-            min_dchi2=min_dchi2, polish=polish, rescale_errors="auto")
+            min_dchi2=min_dchi2, patience=patience,
+            target_chi2_red=target_chi2_red, target_dw=target_dw,
+            polish=polish, rescale_errors="auto")
     elif method == "full":
         result = fcs_linsolve.solve_linear(G_k, A, sigma=sig_k, nonneg=mask,
                                            rescale_errors="auto")
@@ -278,14 +315,27 @@ def fit_dataset(ds, tf_min=None, tf_max=None, per_decade=None,
 
     # Report the span check with the fit, not only in the dialog, so a result
     # read months later still says whether its basis was supported.
-    span = span_check(grid, float(np.min(tau_k)), float(np.max(tau_k)))
+    # Degeneracy diagnostics on the WEIGHTED matrix, since two columns that
+    # differ only where the errors are large are not distinguishable.  cond
+    # says the basis is degenerate; these say which columns are responsible and
+    # how close the worst pair is.
+    Aw = A if sig_k is None else A / sig_k[:, None]
+    n_basis_cols = grid.size
+    coh = fcs_linsolve.column_coherence(Aw[:, :n_basis_cols])
+    coh_base = float("nan")
+    if include_baseline:
+        cb = fcs_linsolve.column_coherence(
+            Aw, groups=(["basis"] * n_basis_cols) + ["baseline"])
+        coh_base = cb.get("cross_max", float("nan"))
+
+    span = span_check(grid, float(np.min(tau_k)), float(np.max(tau_k)), mdl)
     if span["message"]:
         notes.append("basis span: " + span["message"])
 
     # ---- summary scalars ----------------------------------------------------
     amp = result.d[:n_tau]
     amp_err = result.d_err[:n_tau]
-    tau_char = grid * _TAUFACTOR_ANCHOR_S
+    tau_char = fcs_linsolve.characteristic_times(grid, mdl)
 
     baseline = float(result.d[n_tau]) if include_baseline else 0.0
     baseline_err = float(result.d_err[n_tau]) if include_baseline else float("nan")
@@ -328,12 +378,19 @@ def fit_dataset(ds, tf_min=None, tf_max=None, per_decade=None,
         "G0": G0, "N": N, "tau_mean": tau_mean, "width_decades": width_dec,
         "n_live": live, "n_basis": n_tau,
         "chi2": result.chi2, "chi2_red": result.chi2_red, "dof": result.dof,
+        "durbin_watson": float(getattr(result, "durbin_watson", float("nan"))),
         "cond": result.cond, "rank": result.rank,
         "weighted": sig_k is not None,
         "method": method,
+        "basis_model": mdl.key,
+        "basis_model_name": mdl.name,
         "n_iter": int(getattr(result, "n_iter", 0)),
         "converged": bool(getattr(result, "converged", True)),
         "span": span,
+        "coherence": coh,
+        "coherence_max": coh["max"],
+        "coherence_pair": coh["pair"],
+        "coherence_baseline": coh_base,
         "error_rescaled": result.error_rescaled,
         "n_dropped": n_dropped,
         "notes": notes,
@@ -397,9 +454,10 @@ def plot_matrix_curve(fit, show=True):
     ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
     fcs_plottools.adaptive_legend(ax, base_fontsize=9, loc="upper right")
     ax.set_title("Matrix method — %s\n%d basis vectors  ·  %d non-zero  ·  "
-                 "χ²/dof = %.4g"
+                 "χ²/dof = %.4g  ·  DW = %.3f"
                  % (fit["name"], fit["n_basis"], fit["n_live"],
-                    fit["chi2_red"]), fontsize=10)
+                    fit["chi2_red"],
+                    fit.get("durbin_watson", float("nan"))), fontsize=10)
     plt.setp(ax.get_xticklabels(), visible=False)
 
     res = fit["residual_weighted"] if fit["weighted"] else fit["residual"]
@@ -413,6 +471,10 @@ def plot_matrix_curve(fit, show=True):
     axr.set_xscale("log")
     axr.set_xlabel("Lag time τ (ms)", fontsize=12)
     axr.set_ylabel("resid/σ" if fit["weighted"] else "resid", fontsize=10)
+    dwv = fit.get("durbin_watson", float("nan"))
+    if np.isfinite(dwv):
+        axr.text(0.985, 0.06, "DW %.3f" % dwv, transform=axr.transAxes,
+                 ha="right", va="bottom", fontsize=8, color="0.35")
     axr.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
     axr.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:.2g}"))
 
@@ -420,6 +482,23 @@ def plot_matrix_curve(fit, show=True):
     if show:
         fcs_plottools.show_figure(fig, axes)
     return fig, axes
+
+
+def _dw_verdict(dw):
+    """Short plain-language reading of a Durbin-Watson value.
+
+    2 is the no-structure value.  Below about 1.5 the residuals visibly run in
+    arcs; above about 2.5 they alternate, which is what overfitting looks like.
+    """
+    if not np.isfinite(dw):
+        return ""
+    if dw < 1.0:
+        return "   strong systematic structure"
+    if dw < 1.5:
+        return "   noticeable structure"
+    if dw <= 2.5:
+        return "   no structure detected"
+    return "   residuals alternate; the fit may be chasing noise"
 
 
 def _log_bin_edges(x):
@@ -545,23 +624,29 @@ def _write_distribution(path, fits):
     tau_char_s is what makes this directly plottable -- the distribution is
     read as (tau_char_s, d), with taufactor kept alongside as the internal
     coordinate for anyone reconstructing the basis.
+
+    Nothing about HOW a column was generated appears here.  The generating
+    function's internal parameters are its own; a different one need not have
+    the same ones, or the same number of them, and an output column that only
+    some bases can fill is an output column that cannot be relied on.
     """
     cv = fcs_export.csv_value
     with Path(path).open("w", encoding="utf-8-sig", newline="") as fh:
         fh.write("# FCS matrix-method fit — amplitude distribution\n")
         fh.write("# written : %s\n" % datetime.now().isoformat(timespec="seconds"))
-        fh.write("# taufactor anchor : taufactor 1 = %g s\n" % _TAUFACTOR_ANCHOR_S)
+        mdl_keys = sorted({f.get("basis_model", "?") for f in fits})
+        fh.write("# basis model : %s\n" % ", ".join(mdl_keys))
+        fh.write("# taufactor anchor : taufactor 1 = %g s\n"
+                 % _anchor(mdl_keys[0] if len(mdl_keys) == 1 else None))
         fh.write("# note : plot d against tau_char_s; d_err is blank where the "
                  "amplitude is pinned at the d >= 0 bound\n")
-        fh.write("dataset,index,taufactor,tau_char_s,t1_s,t2_s,d,d_err,pinned\n")
+        fh.write("dataset,index,taufactor,tau_char_s,d,d_err,pinned\n")
         for f in fits:
             nm = f["name"].replace(",", "_")
-            t1, t2 = fcs_linsolve.basis_component_times(f["taufactor"])
             for i in range(f["d"].size):
-                fh.write("%s,%d,%s,%s,%s,%s,%s,%s,%s\n" % (
+                fh.write("%s,%d,%s,%s,%s,%s,%s\n" % (
                     nm, i,
                     cv(f["taufactor"][i]), cv(f["tau_char"][i]),
-                    cv(t1[i]), cv(t2[i]),
                     cv(f["d"][i]), cv(f["d_err"][i]),
                     "yes" if f["pinned"][i] else "no"))
     print("[matrixfit] wrote %s" % path)
@@ -569,9 +654,10 @@ def _write_distribution(path, fits):
 
 
 _SUMMARY_HEADER = [
-    "dataset", "method", "G0_sum_d", "N", "tau_mean_s", "width_decades",
-    "baseline", "baseline_err", "chi2_red", "dof", "cond",
+    "dataset", "basis_model", "method", "G0_sum_d", "N", "tau_mean_s", "width_decades",
+    "baseline", "baseline_err", "chi2_red", "durbin_watson", "dof", "cond",
     "n_basis", "n_live", "n_iter", "converged",
+    "coherence_max", "coherence_baseline",
     "n_unsupported", "n_lags", "n_dropped", "weighted",
 ]
 
@@ -581,11 +667,14 @@ def _summary_rows(fits):
     for f in fits:
         span = f.get("span", {})
         rows.append([
-            f["name"], f.get("method", "?"),
+            f["name"], f.get("basis_model", "?"), f.get("method", "?"),
             f["G0"], f["N"], f["tau_mean"], f["width_decades"],
-            f["baseline"], f["baseline_err"], f["chi2_red"], f["dof"],
+            f["baseline"], f["baseline_err"], f["chi2_red"],
+            f.get("durbin_watson", float("nan")), f["dof"],
             f["cond"], f["n_basis"], f["n_live"],
             f.get("n_iter", 0), "yes" if f.get("converged", True) else "no",
+            f.get("coherence_max", float("nan")),
+            f.get("coherence_baseline", float("nan")),
             int(span.get("n_fast", 0)) + int(span.get("n_slow", 0)),
             f["tau"].size, f["n_dropped"], "yes" if f["weighted"] else "no",
         ])
@@ -600,8 +689,10 @@ def _report_lines(fits, grid_desc):
     L.append("fitted     : %s" % datetime.now().isoformat(timespec="seconds"))
     L.append("datasets   : %d  (one independent solve each)" % len(fits))
     L.append("basis      : %s" % grid_desc)
+    keys = sorted({f.get("basis_model", "?") for f in fits})
+    L.append("basis model: %s" % ", ".join(keys))
     L.append("anchor     : taufactor 1 = %g s characteristic time"
-             % _TAUFACTOR_ANCHOR_S)
+             % _anchor(keys[0] if len(keys) == 1 else None))
     L.append("")
     L.append("G0 and <N> are computed from the BASIS amplitudes only; the")
     L.append("baseline column is an additive offset, not a correlating")
@@ -620,7 +711,18 @@ def _report_lines(fits, grid_desc):
             L.append("rounds     : %d%s" % (f.get("n_iter", 0),
                      "" if f.get("converged", True) else "  (HIT THE CAP)"))
         L.append("chi2/dof   : %.6g   (dof %d)" % (f["chi2_red"], f["dof"]))
+        dw = f.get("durbin_watson", float("nan"))
+        L.append("Durbin-Watson: %.4f%s" % (dw, _dw_verdict(dw)))
         L.append("cond       : %.4g   rank %d" % (f["cond"], f["rank"]))
+        pair = f.get("coherence_pair")
+        if pair is not None and np.isfinite(f.get("coherence_max", np.nan)):
+            tc = f["tau_char"]
+            L.append("coherence  : %.6f  worst pair %.4g and %.4g ms"
+                     % (f["coherence_max"], tc[pair[0]] * 1e3,
+                        tc[pair[1]] * 1e3))
+        if np.isfinite(f.get("coherence_baseline", np.nan)):
+            L.append("  vs baseline: %.6f  (1.0 means a basis vector is flat "
+                     "over the measured lags)" % f["coherence_baseline"])
         L.append("G0 = sum d : %.6g" % f["G0"])
         L.append("<N>        : %.6g" % f["N"])
         L.append("mean tau   : %.6g s" % f["tau_mean"])
@@ -659,7 +761,8 @@ def export_matrix_fit(fits, out_source, name_override=None, grid_desc=""):
         ["FCS matrix-method fit — summary",
          "method : linear decomposition onto a fixed basis, d >= 0",
          "basis : %s" % grid_desc,
-         "anchor : taufactor 1 = %g s" % _TAUFACTOR_ANCHOR_S,
+         "basis model : %s" % ", ".join(sorted({f.get("basis_model", "?")
+                                                for f in fits})),
          "note : G0 and N exclude the baseline column",
          "amplitudes : see the companion _distribution.csv"],
         _SUMMARY_HEADER, _summary_rows(fits),
@@ -693,25 +796,60 @@ def _setup_dialog(parent, datasets):
     import tkinter as tk
     from tkinter import messagebox
 
-    win = tk.Toplevel(parent)
-    win.title("Matrix method — setup")
-    win.resizable(False, False)
-    win.grab_set()
+    # Resizable, scrolling, with the buttons pinned outside the scroll area.
+    # This window is over a thousand pixels tall with every section expanded,
+    # so on a laptop the Solve button was simply off the bottom of the screen.
+    win, body, btns = scrollable_dialog(parent, "Matrix method — setup")
 
-    tk.Label(win, text="Correlation — matrix method",
+    tk.Label(body, text="Correlation — matrix method",
              font=("Helvetica", 12, "bold"), pady=6).pack()
-    tk.Label(win, text="%d dataset%s; each is solved independently."
+    tk.Label(body, text="%d dataset%s; each is solved independently."
                        % (len(datasets), "" if len(datasets) == 1 else "s"),
              font=("Helvetica", 9), fg="grey").pack()
 
-    grid_f = tk.LabelFrame(win, text="Basis", padx=10, pady=6)
+    grid_f = tk.LabelFrame(body, text="Basis", padx=10, pady=6)
     grid_f.pack(fill="x", padx=12, pady=(8, 4))
+
+    # Basis set selector.  Always a dropdown, even while only one set is
+    # registered, so the choice is visible rather than implied and a second set
+    # appears here with no change to this dialog.  The menu lists display
+    # NAMES; _basis_key maps the selection back to the registry key that gets
+    # recorded in the exports.
+    _by_name = {m.name: k for k, m in fcs_linsolve.BASIS_MODELS.items()}
+    names = sorted(_by_name)
+    model_var = tk.StringVar(master=win,
+                             value=fcs_linsolve.get_basis_model().name)
+
+    def _basis_key():
+        return _by_name.get(model_var.get(), fcs_linsolve.get_basis_model().key)
+
+    tk.Label(grid_f, text="Basis set:", anchor="w",
+             font=("Helvetica", 9)).pack(fill="x")
+    om = tk.OptionMenu(grid_f, model_var, *names)
+    om.config(font=("Helvetica", 9), anchor="w")
+    om["menu"].config(font=("Helvetica", 9))
+    om.pack(fill="x", pady=(0, 2))
+
+    basis_desc = tk.Label(grid_f, text="", font=("Helvetica", 8), fg="grey",
+                          anchor="w", justify="left", wraplength=430)
+    basis_desc.pack(fill="x", pady=(0, 4))
 
     # Prefilled from the fcs_linsolve constants, which fcs_prefs may already
     # have overridden; editable here for a one-off run without disturbing the
     # stored preference.
-    rows = [("Shortest taufactor", "%g" % fcs_linsolve._TAUFACTOR_MIN),
-            ("Longest taufactor", "%g" % fcs_linsolve._TAUFACTOR_MAX),
+    # With _AUTO_TAUFACTOR_SPAN on, the span starts at what these particular
+    # lags support rather than at the stored preference, so the red warning
+    # below starts clear.  Still editable: this sets the starting point, it
+    # does not constrain what can be entered.
+    _lo0, _hi0 = lag_range(datasets)
+    _auto_lo, _auto_hi = supported_taufactor_span(_lo0, _hi0)
+    if _AUTO_TAUFACTOR_SPAN and _auto_lo is not None:
+        _tf_min0, _tf_max0 = _auto_lo, _auto_hi
+    else:
+        _tf_min0 = fcs_linsolve._TAUFACTOR_MIN
+        _tf_max0 = fcs_linsolve._TAUFACTOR_MAX
+    rows = [("Shortest taufactor", "%g" % _tf_min0),
+            ("Longest taufactor", "%g" % _tf_max0),
             ("Vectors per decade", "%d" % fcs_linsolve._TAUFACTOR_PER_DECADE)]
     entries = []
     for label, val in rows:
@@ -738,7 +876,8 @@ def _setup_dialog(parent, datasets):
 
     lag_lo, lag_hi = lag_range(datasets)
     if lag_lo is not None:
-        sup_lo, sup_hi = supported_taufactor_span(lag_lo, lag_hi)
+        sup_lo, sup_hi = supported_taufactor_span(lag_lo, lag_hi,
+                                                  _basis_key())
         tk.Label(grid_f,
                  text="      Lags span %.4g to %.4g ms, supporting taufactor "
                       "%.4g to %.4g." % (lag_lo * 1e3, lag_hi * 1e3,
@@ -754,19 +893,25 @@ def _setup_dialog(parent, datasets):
         except (ValueError, TypeError):
             count_lbl.config(text="      (enter a valid span)")
             warn_lbl.config(text="")
+            basis_desc.config(
+                text="      "
+                     + fcs_linsolve.get_basis_model(_basis_key()).description)
             return
         count_lbl.config(
             text="      %d basis vectors, characteristic times %.4g to %.4g ms"
-                 % (g.size, g[0] * _TAUFACTOR_ANCHOR_S * 1e3,
-                    g[-1] * _TAUFACTOR_ANCHOR_S * 1e3))
-        chk = span_check(g, lag_lo, lag_hi)
+                 % (g.size, g[0] * _anchor(_basis_key()) * 1e3,
+                    g[-1] * _anchor(_basis_key()) * 1e3))
+        basis_desc.config(
+            text="      " + fcs_linsolve.get_basis_model(_basis_key()).description)
+        chk = span_check(g, lag_lo, lag_hi, _basis_key())
         warn_lbl.config(text=("      " + chk["message"]) if chk["message"] else "")
 
     for v in entries:
         v.trace_add("write", _refresh_count)
+    model_var.trace_add("write", _refresh_count)
     _refresh_count()
 
-    opt_f = tk.LabelFrame(win, text="Options", padx=10, pady=6)
+    opt_f = tk.LabelFrame(body, text="Options", padx=10, pady=6)
     opt_f.pack(fill="x", padx=12, pady=4)
 
     have_sigma = all(ds.get("sigma") is not None
@@ -783,7 +928,7 @@ def _setup_dialog(parent, datasets):
     tk.Checkbutton(opt_f, variable=base_var, anchor="w",
                    text="Fit a free baseline column").pack(fill="x")
 
-    method_f = tk.LabelFrame(win, text="Solver", padx=10, pady=6)
+    method_f = tk.LabelFrame(body, text="Solver", padx=10, pady=6)
     method_f.pack(fill="x", padx=12, pady=4)
     method_var = tk.StringVar(master=win, value="greedy")
     tk.Radiobutton(method_f, variable=method_var, value="greedy", anchor="w",
@@ -802,12 +947,54 @@ def _setup_dialog(parent, datasets):
                    text="Re-solve selected amplitudes jointly at the end"
                    ).pack(fill="x")
 
+    # Stopping rules for the iterative solver.  Prefilled from the fcs_linsolve
+    # constants, which Settings > Preferences also writes to, and editable here
+    # for one run without disturbing the stored value.  These decide how hard
+    # the search works, and the honest default is whatever gives residuals with
+    # no structure left in them -- which is not always what chi2 per degree of
+    # freedom says, because that trusts sigma to be a fair estimate of the
+    # scatter and a generous sigma stops the search early.
+    stop_f = tk.LabelFrame(body, text="Stopping (iterative solver)",
+                           padx=10, pady=6)
+    stop_f.pack(fill="x", padx=12, pady=4)
+    stop_rows = [
+        ("Target chi2/dof", "%g" % fcs_linsolve._CD_TARGET_CHI2_RED
+         if fcs_linsolve._CD_TARGET_CHI2_RED else "0",
+         "0 switches this off and lets the chi2 improvement rule govern."),
+        ("Min chi2 improvement", "%g" % fcs_linsolve._CD_MIN_DCHI2,
+         "A round buying less than this counts as stalled.  Lower it to keep "
+         "adding components."),
+        ("Stalled rounds allowed", "%d" % fcs_linsolve._CD_PATIENCE,
+         "Consecutive stalled rounds before stopping."),
+        ("Maximum rounds", "%d" % fcs_linsolve._CD_MAX_ITER, ""),
+        ("Target Durbin-Watson", "%g" % fcs_linsolve._CD_TARGET_DW,
+         "0 switches this off. Around 1.8 means 'keep going until the "
+         "residuals have no structure left', which is a stronger demand than "
+         "chi2/dof and does not depend on G_std being a fair error estimate."),
+    ]
+    stop_vars = []
+    for label, val, hint in stop_rows:
+        r = tk.Frame(stop_f)
+        r.pack(fill="x", pady=1)
+        tk.Label(r, text=label + ":", anchor="w", font=("Helvetica", 9),
+                 width=22).pack(side="left")
+        v = tk.StringVar(master=win, value=val)
+        tk.Entry(r, textvariable=v, width=10, justify="right",
+                 font=("Helvetica", 9)).pack(side="right")
+        stop_vars.append(v)
+        if hint:
+            tk.Label(stop_f, text="      " + hint, font=("Helvetica", 8),
+                     fg="grey", anchor="w", justify="left",
+                     wraplength=430).pack(fill="x")
+    (target_var, mindchi_var, patience_var, maxiter_var,
+     targetdw_var) = stop_vars
+
     tk.Label(opt_f, text="      Amplitudes are constrained to d ≥ 0; the "
                          "baseline is not.",
              font=("Helvetica", 8), fg="grey", anchor="w",
              justify="left").pack(fill="x")
 
-    name_f = tk.Frame(win)
+    name_f = tk.Frame(body)
     name_f.pack(fill="x", padx=12, pady=(4, 2))
     tk.Label(name_f, text="Label (optional):", anchor="w",
              font=("Helvetica", 9)).pack(side="left")
@@ -816,7 +1003,7 @@ def _setup_dialog(parent, datasets):
              font=("Helvetica", 9)).pack(side="right")
 
     export_var = tk.BooleanVar(master=win, value=True)
-    tk.Checkbutton(win, variable=export_var, anchor="w",
+    tk.Checkbutton(body, variable=export_var, anchor="w",
                    text="Write report, curves, distribution and summary"
                    ).pack(fill="x", padx=16)
 
@@ -831,6 +1018,23 @@ def _setup_dialog(parent, datasets):
                                  "count per decade a whole number.", parent=win)
             return
         try:
+            stop_target = float(target_var.get())
+            stop_mind = float(mindchi_var.get())
+            stop_pat = int(patience_var.get())
+            stop_max = int(maxiter_var.get())
+            stop_dw = float(targetdw_var.get())
+            if (stop_target < 0 or stop_mind < 0 or stop_pat < 1
+                    or stop_max < 1 or stop_dw < 0):
+                raise ValueError
+        except (TypeError, ValueError):
+            messagebox.showerror(
+                "Invalid input",
+                "Target chi2/dof, the minimum improvement and the target "
+                "Durbin-Watson must be zero or more; stalled rounds and "
+                "maximum rounds must be at least 1.",
+                parent=win)
+            return
+        try:
             grid = fcs_linsolve.log_taufactor_grid(tf_min, tf_max, per_dec)
         except ValueError as exc:
             messagebox.showerror("Invalid basis", str(exc), parent=win)
@@ -842,7 +1046,11 @@ def _setup_dialog(parent, datasets):
                                 weighted=weight_var.get(),
                                 include_baseline=base_var.get(),
                                 method=method_var.get(),
-                                polish=polish_var.get())
+                                polish=polish_var.get(),
+                                basis_model=_basis_key(),
+                                target_chi2_red=stop_target,
+                                min_dchi2=stop_mind, patience=stop_pat,
+                                max_iter=stop_max, target_dw=stop_dw)
         except ValueError as exc:
             messagebox.showerror("Fit failed", str(exc), parent=win)
             return
@@ -854,21 +1062,25 @@ def _setup_dialog(parent, datasets):
             plot_matrix_fit(f, show=True)
 
         if export_var.get():
-            chk = span_check(grid, lag_lo, lag_hi)
+            chk = span_check(grid, lag_lo, lag_hi, _basis_key())
             desc = ("%d vectors, taufactor %g to %g at %d per decade, "
-                    "solver %s%s"
-                    % (grid.size, tf_min, tf_max, per_dec, method_var.get(),
+                    "basis %s, solver %s (target chi2/dof %g, min dchi2 %g, "
+                    "patience %d, max %d, target DW %g)%s"
+                    % (grid.size, tf_min, tf_max, per_dec, _basis_key(),
+                       method_var.get(), stop_target, stop_mind, stop_pat,
+                       stop_max, stop_dw,
                        ("; " + chk["message"]) if chk["message"] else ""))
             export_matrix_fit(fits, datasets[0]["path"],
                               name_var.get().strip() or None, desc)
 
-    btns = tk.Frame(win)
-    btns.pack(pady=10)
-    tk.Button(btns, text="Solve", width=12, command=_run, pady=4
+    inner = tk.Frame(btns)
+    inner.pack(pady=10)
+    tk.Button(inner, text="Solve", width=12, command=_run, pady=4
               ).pack(side="left", padx=6)
-    tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4
+    tk.Button(inner, text="Cancel", width=10, command=win.destroy, pady=4
               ).pack(side="left", padx=6)
 
+    fit_dialog_to_screen(win)
     win.wait_window()
 
 
@@ -883,7 +1095,7 @@ def _selftest():
     grid = fcs_linsolve.log_taufactor_grid(1.0, 1.0e3, 20)
     A = fcs_linsolve.build_basis(tau, grid, t_units="s")
     truth = np.zeros(grid.size + 1)
-    truth[np.argmin(np.abs(grid * _TAUFACTOR_ANCHOR_S - 3.0e-5))] = 0.25
+    truth[np.argmin(np.abs(grid * _anchor() - 3.0e-5))] = 0.25
     truth[-1] = -0.002
     G_clean = A.dot(truth)
     n_seg = 50
@@ -1020,7 +1232,7 @@ def _selftest():
     assert bad["n_fast"] > 0 and bad["n_slow"] > 0 and bad["message"]
     assert span_check(grid, None, None)["message"] == ""
     sup = supported_taufactor_span(tau.min(), tau.max())
-    assert np.isclose(sup[0], tau.min() / _TAUFACTOR_ANCHOR_S)
+    assert np.isclose(sup[0], tau.min() / _anchor())
 
     # The regime that broke the full solve: many more columns than lag points.
     t_few = np.logspace(-5, -1, 65)
@@ -1084,10 +1296,14 @@ def _selftest():
 
         dl = dist.read_text(encoding="utf-8-sig").splitlines()
         body = [l for l in dl if not l.startswith("#")]
-        assert body[0].startswith("dataset,index,taufactor,tau_char_s")
+        assert body[0] == "dataset,index,taufactor,tau_char_s,d,d_err,pinned", \
+            "the distribution must expose the characteristic time and nothing "\
+            "about how the column was generated: %s" % body[0]
+        for banned in ("t1", "t2", "f1", "k_", "offset"):
+            assert banned not in body[0], "generator internals leaked: " + banned
         assert len(body) - 1 == 2 * f_new["d"].size
         cols = body[1].split(",")
-        assert np.isclose(float(cols[3]), float(cols[2]) * _TAUFACTOR_ANCHOR_S)
+        assert np.isclose(float(cols[3]), float(cols[2]) * _anchor())
 
         cl = [l for l in cur.read_text(encoding="utf-8-sig").splitlines()
               if not l.startswith("#")]
@@ -1101,6 +1317,219 @@ def _selftest():
         print("exports: report, curves (%d rows), distribution (%d rows), "
               "summary (2 rows), shared stem"
               % (len(cl) - 1, len(body) - 1))
+
+    # --- stopping controls actually change how hard the search works ---------
+    # The default trusts sigma.  When sigma is generous the fit stops with the
+    # residuals still running in systematic arcs, which is the situation these
+    # controls exist to escape.
+    t_s = np.logspace(-5, -1, 55)
+    g_s = fcs_linsolve.log_taufactor_grid(1.0, 1.0e5, 115)
+    A_s = fcs_linsolve.build_basis(t_s, g_s, t_units="s")
+    tr_s = np.zeros(g_s.size + 1)
+    for tf_, a_ in ((60.0, 0.018), (200.0, 0.014), (900.0, 0.010),
+                    (4000.0, 0.005)):
+        tr_s[int(np.argmin(np.abs(g_s - tf_)))] = a_
+    tr_s[-1] = -0.0003
+    true_scatter = 0.0006
+    G_s = A_s.dot(tr_s) + true_scatter * rng.randn(t_s.size)
+    generous = true_scatter * 2.2 * np.ones(t_s.size)
+    ds_s = {"name": "generous-sigma", "path": None, "tau": t_s, "G": G_s,
+            "sigma": generous, "meta": {"G_std_definition": "sem"}}
+
+    def _dw(r):
+        return float(np.sum(np.diff(r) ** 2) / np.sum(r ** 2))
+
+    got = {}
+    for tag, kw in (("default", {}),
+                    ("target off", {"target_chi2_red": 0.0}),
+                    ("target off, min_dchi2 0.05",
+                     {"target_chi2_red": 0.0, "min_dchi2": 0.05})):
+        fs = fit_dataset(ds_s, tf_min=1.0, tf_max=1.0e5, per_decade=115, **kw)
+        got[tag] = fs
+        print("  %-28s %3d rounds, %2d columns, chi2_red %.4f, DW %.3f"
+              % (tag, fs["n_iter"], fs["n_live"], fs["chi2_red"],
+                 _dw(fs["residual_weighted"])))
+    assert got["default"]["n_live"] < got["target off"]["n_live"]
+    assert (got["target off"]["n_live"]
+            < got["target off, min_dchi2 0.05"]["n_live"])
+    # The point of the knobs: residuals go from correlated toward random.
+    assert (_dw(got["target off, min_dchi2 0.05"]["residual_weighted"])
+            > _dw(got["default"]["residual_weighted"]) + 0.5)
+    # 0 disables rather than meaning "stop immediately"
+    assert got["target off"]["n_iter"] > got["default"]["n_iter"]
+    for bad in ({"target_chi2_red": -1.0}, {"patience": 0}, {"max_iter": 0}):
+        try:
+            fit_dataset(ds_s, tf_min=1.0, tf_max=1.0e3, per_decade=20, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for %r" % bad)
+
+    # --- Durbin-Watson is reported and can govern stopping -------------------
+    assert _dw_verdict(0.6).strip().startswith("strong")
+    assert "no structure" in _dw_verdict(2.0)
+    assert "alternate" in _dw_verdict(3.2)
+    assert _dw_verdict(float("nan")) == ""
+
+    f_dw = fit_dataset(ds_s, tf_min=1.0, tf_max=1.0e5, per_decade=115,
+                       target_chi2_red=0.0, min_dchi2=0.0, target_dw=1.8,
+                       max_iter=400)
+    print("  stopping on DW instead of chi2: %d rounds, %d columns, "
+          "chi2_red %.3f, DW %.3f" % (f_dw["n_iter"], f_dw["n_live"],
+                                      f_dw["chi2_red"], f_dw["durbin_watson"]))
+    assert f_dw["durbin_watson"] >= 1.8
+    assert f_dw["durbin_watson"] > got["default"]["durbin_watson"]
+    assert "durbin_watson" in _SUMMARY_HEADER
+
+    # Out-of-order lags would make the statistic meaningless, so they are
+    # sorted and the sort is recorded.
+    sh = np.argsort(rng.rand(t_s.size))
+    ds_shuf = dict(ds_s, tau=t_s[sh], G=G_s[sh], sigma=generous[sh])
+    f_sh = fit_dataset(ds_shuf, tf_min=1.0, tf_max=1.0e3, per_decade=20)
+    assert np.all(np.diff(f_sh["tau"]) > 0), "lags must come back sorted"
+    assert any("ascending order" in n for n in f_sh["notes"])
+    f_ord = fit_dataset(ds_s, tf_min=1.0, tf_max=1.0e3, per_decade=20)
+    assert np.isclose(f_sh["durbin_watson"], f_ord["durbin_watson"]), \
+        "shuffling the input must not change the statistic once sorted"
+    print("  out-of-order lags sorted and reported; DW unchanged (%.4f)"
+          % f_sh["durbin_watson"])
+
+    # --- both shipped basis sets, and the coherence diagnostic ---------------
+    shipped = sorted(fcs_linsolve.BASIS_MODELS)
+    assert shipped == ["gauss3d_1comp", "rh110_pbs_tween_75um_ph"], shipped
+    for key in shipped:
+        fk = fit_dataset(dict(base, sigma=sem,
+                              meta={"G_std_definition": "sem"}),
+                         tf_min=1.0, tf_max=1.0e3, per_decade=20,
+                         basis_model=key)
+        assert fk["basis_model"] == key
+        assert np.isfinite(fk["coherence_max"])
+        i, j = fk["coherence_pair"]
+        assert abs(i - j) == 1, "neighbours should be the worst pair"
+        print("%-26s chi2_red %.3f  worst coherence %.6f (%.4g vs %.4g ms)  "
+              "vs baseline %.4f"
+              % (key, fk["chi2_red"], fk["coherence_max"],
+                 fk["tau_char"][i] * 1e3, fk["tau_char"][j] * 1e3,
+                 fk["coherence_baseline"]))
+    # A grid running past the last lag makes a basis vector flat, i.e. the same
+    # direction as the baseline; the diagnostic must say so.
+    f_slow = fit_dataset(dict(base, sigma=sem, meta={"G_std_definition": "sem"}),
+                         tf_min=1.0e4, tf_max=1.0e7, per_decade=5)
+    print("  grid far past the last lag: coherence with the baseline %.6f"
+          % f_slow["coherence_baseline"])
+    assert f_slow["coherence_baseline"] > 0.999, f_slow["coherence_baseline"]
+    assert "coherence_max" in _SUMMARY_HEADER
+
+    # --- the pipeline is independent of the generating function ---------------
+    def _build_exp(t_sec, taufactors):
+        return np.exp(-t_sec[:, None] / (taufactors[None, :] * 1.0e-3))
+
+    fcs_linsolve.register_basis_model(fcs_linsolve.BasisModel(
+        key="_selftest_exp", name="Single exponential", anchor_s=1.0e-3,
+        build=_build_exp, description="self-test only"))
+    try:
+        f_alt = fit_dataset(dict(base, sigma=sem,
+                                 meta={"G_std_definition": "sem"}),
+                            tf_min=1e-3, tf_max=1e0, per_decade=20,
+                            basis_model="_selftest_exp")
+        assert f_alt["basis_model"] == "_selftest_exp"
+        # The anchor differs by 1000x, so the same taufactor means a different
+        # time -- which is exactly what must NOT be hardcoded anywhere.
+        assert np.isclose(f_alt["tau_char"][0], f_alt["taufactor"][0] * 1.0e-3)
+        with tempfile.TemporaryDirectory() as td2:
+            src2 = Path(td2) / "d" / "analysis" / "x_correlation_cross.csv"
+            src2.parent.mkdir(parents=True)
+            src2.touch()
+            _o, _r, _c, dist2, summ2 = export_matrix_fit([f_alt], src2, "alt", "")
+            head = [l for l in dist2.read_text(encoding="utf-8-sig").splitlines()
+                    if not l.startswith("#")][0]
+            assert head == "dataset,index,taufactor,tau_char_s,d,d_err,pinned"
+            srow = [l for l in summ2.read_text(encoding="utf-8-sig").splitlines()
+                    if not l.startswith("#")][1]
+            assert "_selftest_exp" in srow, "the summary must record the basis"
+        print("alternative generating function: fit, export and summary all "
+              "worked unchanged (anchor %.4g s)" % 1.0e-3)
+    finally:
+        del fcs_linsolve.BASIS_MODELS["_selftest_exp"]
+
+    # --- the setup dialog exposes the basis set as a dropdown -----------------
+    # Built for real under tkinter when a display is available, because a
+    # one-entry OptionMenu is exactly the kind of widget that parses fine and
+    # renders wrong.
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+    except Exception as exc:                       # noqa: BLE001
+        print("no display (%s); skipped the dialog check" % type(exc).__name__)
+    else:
+        root.withdraw()
+        captured = {}
+        real_wait = tk.Toplevel.wait_window
+        tk.Toplevel.wait_window = lambda self, *a: captured.setdefault("w", self)
+        try:
+            _selftest_ds = [{"name": "d", "path": "/tmp/x.csv", "tau": tau,
+                             "G": G, "sigma": sem,
+                             "meta": {"G_std_definition": "sem"}}]
+            _setup_dialog(root, _selftest_ds)
+            win = captured["w"]
+            win.update_idletasks()
+            menus = []
+
+            def _find(w):
+                for c in w.winfo_children():
+                    if c.winfo_class() == "Menubutton":
+                        menus.append(c)
+                    _find(c)
+
+            _find(win)
+            assert len(menus) == 1, "expected exactly one dropdown, got %d" % len(menus)
+            mb = menus[0]
+            menu = mb.nametowidget(mb.cget("menu"))
+            entries = [menu.entrycget(i, "label")
+                       for i in range(menu.index("end") + 1)]
+            registered = {m.name for m in fcs_linsolve.BASIS_MODELS.values()}
+            assert set(entries) == registered, (entries, registered)
+            assert mb.cget("text") == fcs_linsolve.get_basis_model().name
+            print("basis-set dropdown built with %d entry/entries: %s"
+                  % (len(entries), entries[0]))
+
+            # Resizable, scrolling, buttons pinned.  This window is over a
+            # thousand pixels tall with every section expanded, so on a laptop
+            # the Solve button used to sit below the bottom of the screen with
+            # no way to reach it.
+            assert win.resizable() == (True, True), "the dialog must resize"
+            wanted = win.winfo_reqheight()
+            actual = win.winfo_height()
+            assert actual <= int(win.winfo_screenheight() * 0.85) + 1, \
+                "height must be capped to the screen, got %d" % actual
+            canvas = win._scroll_canvas
+            bars = [c for c in canvas.master.winfo_children()
+                    if c.winfo_class() == "Scrollbar"]
+            assert len(bars) == 1, "expected exactly one scrollbar"
+            found = []
+
+            def _buttons(w_):
+                for c in w_.winfo_children():
+                    if c.winfo_class() == "Button":
+                        found.append(c)
+                    _buttons(c)
+
+            _buttons(win)
+            solve = [b for b in found if b.cget("text") == "Solve"]
+            assert solve, "no Solve button"
+            solve = solve[0]
+            assert not solve.winfo_parent().startswith(str(canvas)), \
+                "Solve must live outside the scrolling area"
+            canvas.yview_moveto(1.0)
+            win.update_idletasks()
+            assert solve.winfo_ismapped(), \
+                "Solve must stay visible with the body scrolled to the bottom"
+            print("  window %d px of content shown in %d px, scrollbar "
+                  "present, Solve pinned outside it" % (wanted, actual))
+            win.destroy()
+        finally:
+            tk.Toplevel.wait_window = real_wait
+            root.destroy()
 
     # --- plotting, headless ---------------------------------------------------
     import matplotlib

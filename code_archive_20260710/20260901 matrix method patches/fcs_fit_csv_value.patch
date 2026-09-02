@@ -1,0 +1,33 @@
+diff --git a/fcs_fit.py b/fcs_fit.py
+index 0c09be6..8cdfa45 100644
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -1234,14 +1234,24 @@ def export_global_fit(result: dict, out_source: str | Path,
+                      f"{1 - result['ss_res'] / _grand_ss_tot(result['datasets']):.10g}\n")
+         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
+         fh.write(",".join(header) + "\n")
++        # Numeric cells go through fcs_export.csv_value, the renderer the shared
++        # exporter uses everywhere else.  Formatting them directly with :.10g
++        # writes the literal text "nan" for a non-finite value, where every
++        # other CSV in the suite -- and the .xlsx written beside this one --
++        # leaves the cell BLANK.  That divergence is exactly what csv_value was
++        # written to close: a value that vanished in the spreadsheet reappeared
++        # as a string in the CSV, so the two files disagreed about whether a
++        # number existed.  The dataset name is text and is written as-is.
+         for ds in result["datasets"]:
+             for i in range(ds["n_points"]):
+                 row = [ds["name"],
+-                       f"{ds['tau'][i]:.10g}", f"{ds['tau'][i]*1e3:.10g}",
+-                       f"{ds['G'][i]:.10g}", f"{ds['Gfit'][i]:.10g}",
+-                       f"{ds['resid'][i]:.10g}"]
++                       fcs_export.csv_value(ds["tau"][i]),
++                       fcs_export.csv_value(ds["tau"][i] * 1e3),
++                       fcs_export.csv_value(ds["G"][i]),
++                       fcs_export.csv_value(ds["Gfit"][i]),
++                       fcs_export.csv_value(ds["resid"][i])]
+                 if weighted:
+-                    row.append(f"{ds['sigma'][i]:.10g}")
++                    row.append(fcs_export.csv_value(ds["sigma"][i]))
+                 fh.write(",".join(row) + "\n")
+ 
+     print(f"[globalfit] wrote {report_path}")

@@ -1,0 +1,189 @@
+--- a/fcs_plottools.py	2026-09-02 18:00:27.569964787 +0000
++++ b/fcs_plottools.py	2026-09-02 18:01:26.644525638 +0000
+@@ -1129,8 +1129,53 @@
+ # averaging a few leading points beats it at no cost for a monotone decay.
+ # Module-level so the preferences system can retarget it at runtime, the
+ # same pattern _FIGURE_FORMAT follows; it is re-read on every toggle.
++def _autoscale_axes(a) -> None:
++    """Rescale one axes to its currently visible data.
++
++    Two things make the obvious ``a.relim(); a.autoscale_view()`` a no-op, and
++    both bit the Axis-limits "Auto" button, which never worked:
++
++    1. ``set_xlim``/``set_ylim`` turn autoscaling OFF for that axis, and every
++       plotter in the suite sets limits when it draws.  ``autoscale_view()``
++       then respects the disabled flag and returns without doing anything, so
++       autoscaling has to be switched back on first.
++    2. ``relim()`` walks lines and patches but IGNORES collections, so a
++       fill_between, a vlines stem plot or the error bars of an errorbar call
++       are invisible to it.  Their extents have to be folded into the data
++       limits by hand.
++
++    ``visible_only=True`` keeps traces hidden in the Traces section out of the
++    range, which is what someone who just hid a trace expects.
++    """
++    try:
++        a.set_autoscalex_on(True)
++        a.set_autoscaley_on(True)
++        a.relim(visible_only=True)
++        for col in a.collections:
++            try:
++                a.update_datalim(col.get_datalim(a.transData))
++            except Exception:      # noqa: BLE001 - one odd collection must
++                pass               # not stop the rest rescaling
++        a.autoscale_view()
++    except Exception:              # noqa: BLE001 - rescaling is cosmetic
++        pass
++
++
+ _NORMALIZE_K = 3
+ 
++# How the normalization reference is chosen: "leading" divides by the mean of
++# the first _NORMALIZE_K plotted points, "peak" by the largest value.
++#
++# Leading points suit correlation curves, which start at their maximum.  They
++# are wrong for a lifetime decay, whose first plotted points sit on the RISE
++# before the peak, so dividing by them scales every curve by an essentially
++# arbitrary number partway up the leading edge.
++_NORMALIZE_MODE = "leading"
++
++# Upper y limit applied while normalized.  Slightly above 1 on purpose: a trace
++# touching the very top of the frame looks clipped even when it is not.
++_NORMALIZE_YMAX = 1.1
++
+ 
+ def _build_normalize_section(
+     panel,
+@@ -1185,6 +1230,25 @@
+     # the division did.
+     saved: dict = {}
+     ylabel_box = {"orig": None}
++    ylim_box: dict = {"orig": None}
++    mode_var = None                # bound below; read by _ref_value
++
++    def _apply_norm_ylim() -> None:
++        """Pin the y range to 0 .. _NORMALIZE_YMAX while normalized.
++
++        Normalized traces all top out near 1, so letting matplotlib autoscale
++        wastes the frame or crops the peak depending on the noise.  A log y
++        axis cannot include 0, so there only the TOP is pinned and the bottom
++        is left wherever autoscaling put it.
++        """
++        try:
++            if ax.get_yscale() == "log":
++                lo, _hi = ax.get_ylim()
++                ax.set_ylim(lo, _NORMALIZE_YMAX)
++            else:
++                ax.set_ylim(0.0, _NORMALIZE_YMAX)
++        except Exception:          # noqa: BLE001 - cosmetic
++            pass
+ 
+     def _is_reference(line) -> bool:
+         """
+@@ -1205,8 +1269,7 @@
+             return True        # cannot read it -> do not touch it
+ 
+     def _rescale_and_draw():
+-        ax.relim()
+-        ax.autoscale_view()
++        _autoscale_axes(ax)
+         try:
+             fig.canvas.draw_idle()
+         except Exception:
+@@ -1231,10 +1294,15 @@
+                         yv = np.asarray(ln.get_ydata(), dtype=float)
+                     except Exception:
+                         yv = np.empty(0)
+-                    lead = yv[:k]
+-                    lead = lead[np.isfinite(lead)]
+-                    ref_cache[key] = (float(lead.mean()) if lead.size
+-                                      else float("nan"))
++                    if mode_var.get() == "peak":
++                        good = yv[np.isfinite(yv)]
++                        ref_cache[key] = (float(good.max()) if good.size
++                                          else float("nan"))
++                    else:
++                        lead = yv[:k]
++                        lead = lead[np.isfinite(lead)]
++                        ref_cache[key] = (float(lead.mean()) if lead.size
++                                          else float("nan"))
+                 return ref_cache[key]
+ 
+             for line in ax.get_lines():
+@@ -1265,7 +1333,11 @@
+                 ylabel_box["orig"] = ax.get_ylabel()
+                 if ylabel_box["orig"]:
+                     ax.set_ylabel(ylabel_box["orig"] + "  (normalized)")
++            if did_any and ylim_box["orig"] is None:
++                ylim_box["orig"] = ax.get_ylim()
+             _rescale_and_draw()
++            if did_any:
++                _apply_norm_ylim()
+             if skipped:
+                 messagebox.showwarning(
+                     "Some traces not normalized",
+@@ -1285,16 +1357,50 @@
+                 ax.set_ylabel(ylabel_box["orig"])
+                 ylabel_box["orig"] = None
+             _rescale_and_draw()
++            # AFTER the rescale, not before: _rescale_and_draw autoscales, so
++            # restoring first would just be overwritten and unchecking would
++            # leave a different range than the user had.
++            if ylim_box["orig"] is not None:
++                ax.set_ylim(*ylim_box["orig"])
++                ylim_box["orig"] = None
++                try:
++                    fig.canvas.draw_idle()
++                except Exception:      # noqa: BLE001 - cosmetic
++                    pass
+ 
+     tk.Checkbutton(
+-        lf, text="Normalize traces  (÷ mean of first "
+-                 f"{max(1, int(_NORMALIZE_K))} pts)",
+-        variable=norm_var, command=_apply, anchor="w", font=("Helvetica", 9),
++        lf, text="Normalize traces", variable=norm_var, command=_apply,
++        anchor="w", font=("Helvetica", 9),
+     ).pack(fill="x")
++
++    mode_var = tk.StringVar(master=panel, value=_NORMALIZE_MODE)
++
++    def _mode_changed(*_):
++        """Re-normalize in place when the reference changes."""
++        if norm_var.get():
++            norm_var.set(False)
++            _apply()
++            norm_var.set(True)
++            _apply()
++
++    mrow = tk.Frame(lf)
++    mrow.pack(fill="x")
++    tk.Label(mrow, text="      divide by:", font=("Helvetica", 9),
++             anchor="w").pack(side="left")
++    tk.Radiobutton(mrow, text=f"first {max(1, int(_NORMALIZE_K))} pts",
++                   variable=mode_var, value="leading", command=_mode_changed,
++                   font=("Helvetica", 9)).pack(side="left")
++    tk.Radiobutton(mrow, text="peak", variable=mode_var, value="peak",
++                   command=_mode_changed,
++                   font=("Helvetica", 9)).pack(side="left")
++
+     tk.Label(
+         lf,
+         text=("      display only — exported CSVs keep physical units.\n"
+-              "      Reference is G at the plotted τ min, not a fitted G(0)."),
++              "      Leading points suit correlation curves; use the peak for\n"
++              "      lifetime decays, whose first points are on the rise.\n"
++              f"      While normalized the y axis is pinned to 0 – "
++              f"{_NORMALIZE_YMAX:g}."),
+         font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+     ).pack(fill="x")
+ 
+@@ -1378,8 +1484,7 @@
+ 
+     def _auto_limits():
+         for a in axes_list:
+-            a.relim()
+-            a.autoscale_view()
++            _autoscale_axes(a)
+         xlo, xhi = axes_list[0].get_xlim()
+         ylo, yhi = _yax().get_ylim()
+         xlo_var.set(f"{xlo:.6g}")
