@@ -47,6 +47,7 @@ import fcs_lifetime
 import fcs_lifetime_fit
 import fcs_pch_fit
 import fcs_matrixfit
+import fcs_basisfit
 import fcs_fisher
 import fcs_noise
 
@@ -252,41 +253,6 @@ def _fmt_cps_err(x: Optional[float], err: Optional[float]) -> str:
     if err is None or not np.isfinite(err):
         return base
     return f"{base} ± {err:,.{dec}f}"
-
-
-def _std_is_sem(meta: Optional[dict]) -> bool:
-    """
-    True when a correlation CSV's ``G_std`` is the standard error of the mean.
-
-    The presence of the ``G_std_definition`` key is the test, exactly as
-    fcs_corr.rebuild_plot uses it: that key arrived with the SEM convention, so
-    a file lacking it predates it and holds the POPULATION sigma across
-    segments instead -- larger by sqrt(n_segments), roughly 3.2x at the default
-    ten 1 s segments.
-
-    Weighting a fit by the wrong one does not move the fitted values (a uniform
-    scale on sigma cancels out of the minimisation), but it does scale the
-    parameter errors by that same factor and the reduced chi-squared by its
-    square.  So this is a reporting hazard rather than a correctness one, which
-    is why the fit is flagged rather than blocked: the file is still fittable,
-    the numbers it produces are still right, and only the error bars need to be
-    read with the caveat attached.
-
-    Same test in one place for the dialog and the report, so the warning the
-    user saw and the line written into the report cannot disagree.
-    """
-    return bool(meta) and "G_std_definition" in meta
-
-
-def _legacy_sigma_names(datasets) -> list:
-    """
-    Names of the datasets whose G_std predates the SEM convention.
-
-    Takes anything carrying ``name`` and ``meta`` -- the picker's dataset dicts
-    and the per-dataset entries in a fit result both qualify -- so the dialog
-    and the report can ask the same question of their own data.
-    """
-    return [ds["name"] for ds in datasets if not _std_is_sem(ds.get("meta"))]
 
 
 def _bg_corr_from_meta(meta: Optional[dict]) -> Optional[Tuple[float, float]]:
@@ -1046,25 +1012,6 @@ def export_global_fit(result: dict, out_source: str | Path,
     L.append(f"converged  : {result['success']}  ({result['message']})")
     if result["weighted"]:
         L.append(f"red. chi^2 : {result['red_chi2']:.6g}")
-        # Only when the fit actually used sigma: an unweighted fit never reads
-        # G_std, so the caveat would be a false alarm there.
-        _legacy = _legacy_sigma_names(result["datasets"])
-        if _legacy:
-            L.append("")
-            L.append("WARNING: legacy G_std convention")
-            L.append("-" * 64)
-            L.append("  These datasets were exported before G_std became the "
-                     "standard error of")
-            L.append("  the mean, so their sigma is the POPULATION sigma "
-                     "across segments --")
-            L.append("  larger by sqrt(n_segments).  The fitted VALUES above "
-                     "are unaffected, but")
-            L.append("  their errors are too large by that factor and red. "
-                     "chi^2 too small by its")
-            L.append("  square.  Re-export these correlations to fit them on "
-                     "the current basis.")
-            for _nm in _legacy:
-                L.append(f"    · {_nm}")
     L.append("")
     L.append("Parameter linking")
     L.append("-" * 64)
@@ -1234,24 +1181,14 @@ def export_global_fit(result: dict, out_source: str | Path,
                      f"{1 - result['ss_res'] / _grand_ss_tot(result['datasets']):.10g}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(header) + "\n")
-        # Numeric cells go through fcs_export.csv_value, the renderer the shared
-        # exporter uses everywhere else.  Formatting them directly with :.10g
-        # writes the literal text "nan" for a non-finite value, where every
-        # other CSV in the suite -- and the .xlsx written beside this one --
-        # leaves the cell BLANK.  That divergence is exactly what csv_value was
-        # written to close: a value that vanished in the spreadsheet reappeared
-        # as a string in the CSV, so the two files disagreed about whether a
-        # number existed.  The dataset name is text and is written as-is.
         for ds in result["datasets"]:
             for i in range(ds["n_points"]):
                 row = [ds["name"],
-                       fcs_export.csv_value(ds["tau"][i]),
-                       fcs_export.csv_value(ds["tau"][i] * 1e3),
-                       fcs_export.csv_value(ds["G"][i]),
-                       fcs_export.csv_value(ds["Gfit"][i]),
-                       fcs_export.csv_value(ds["resid"][i])]
+                       f"{ds['tau'][i]:.10g}", f"{ds['tau'][i]*1e3:.10g}",
+                       f"{ds['G'][i]:.10g}", f"{ds['Gfit'][i]:.10g}",
+                       f"{ds['resid'][i]:.10g}"]
                 if weighted:
-                    row.append(fcs_export.csv_value(ds["sigma"][i]))
+                    row.append(f"{ds['sigma'][i]:.10g}")
                 fh.write(",".join(row) + "\n")
 
     print(f"[globalfit] wrote {report_path}")
@@ -1396,6 +1333,10 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
     amplitude of every decay time on a fixed grid.  They answer different
     questions and share no machinery beyond the dataset picker, which is why
     they are separate entries here rather than two models in one chooser.
+    "Curve Basis" is fcs_basisfit: the user supplies a handful of fit curves
+    this suite exported, one per known species, and the mixture is decomposed
+    onto them.  It shares the solver with Matrix Method and nothing else --
+    there is no generating function and no grid, only the curves given.
     Lifetime and PCH dispatch to run_lifetime_fit_dialog / run_pch_fit_dialog
     in the fcs_lifetime_fit and fcs_pch_fit modules respectively.
 
@@ -1420,7 +1361,7 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
 
     win = tk.Toplevel(parent)
     win.title("Model data")
-    win.geometry("340x360")
+    win.geometry("340x410")
     win.resizable(False, False)
     win.grab_set()
 
@@ -1447,6 +1388,11 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
         fcs_matrixfit.run_matrix_dialog(fcs_data, parent=parent,
                                         workspace_order=workspace_order)
 
+    def _correlation_basis():
+        win.destroy()
+        fcs_basisfit.run_basis_dialog(fcs_data, parent=parent,
+                                      workspace_order=workspace_order)
+
     def _lifetime():
         win.destroy()
         # The tail-vs-reconvolution choice comes AFTER this one: asking how to
@@ -1463,6 +1409,8 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None,
               command=_correlation).pack(pady=4)
     tk.Button(btns, text="Correlation (Matrix Method)", width=26, pady=6,
               command=_correlation_matrix).pack(pady=4)
+    tk.Button(btns, text="Correlation (Curve Basis)", width=26, pady=6,
+              command=_correlation_basis).pack(pady=4)
     tk.Button(btns, text="Lifetime", width=26, pady=6,
               command=_lifetime).pack(pady=4)
     tk.Button(btns, text="PCH", width=26, pady=6,
@@ -1670,33 +1618,6 @@ def _global_setup_dialog(parent, model, datasets, out_source):
         variable=weight_var, anchor="w",
         state="normal" if all_have_sigma else "disabled",
     ).pack(fill="x", padx=12, pady=(6, 0))
-
-    # Legacy G_std: a CSV exported before the standard-error convention holds
-    # the POPULATION sigma instead, ~sqrt(n_segments) larger, under the same
-    # column name.  Shown beside the checkbox because this is the screen where
-    # weighting is chosen, and left as a warning rather than a block: the
-    # curve is perfectly fittable and the fitted values are unaffected, so
-    # refusing would be the suite overruling a decision that is the user's.
-    _legacy = _legacy_sigma_names(datasets) if all_have_sigma else []
-    if _legacy:
-        tk.Label(
-            win,
-            text=(f"      ⚠ {len(_legacy)} dataset"
-                  f"{'s' if len(_legacy) != 1 else ''} predate"
-                  f"{'' if len(_legacy) != 1 else 's'} the SEM convention: "
-                  f"G_std is the population\n"
-                  f"      sigma, ~sqrt(n_segments) larger.  Fitted values are "
-                  f"unaffected, but the\n"
-                  f"      parameter errors come out too large and red. χ² too "
-                  f"small.\n"
-                  f"      Re-export these correlations, or fit unweighted."),
-            font=("Helvetica", 8), fg="#a05000", anchor="w", justify="left",
-        ).pack(fill="x", padx=12)
-        tk.Label(
-            win,
-            text="\n".join(f"        · {nm}" for nm in _legacy),
-            font=("Courier", 8), fg="#a05000", anchor="w", justify="left",
-        ).pack(fill="x", padx=12)
 
     # How many channels this would actually remove, so the effect of the
     # option is visible before the fit rather than discovered afterwards.
