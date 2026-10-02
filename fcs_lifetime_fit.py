@@ -723,15 +723,73 @@ def fit_lifetime(
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
+# How the time axis of a fit figure is drawn.  "absolute" is arrival time
+# within the laser cycle, as measured.  "relative" is time since the start of
+# the fit window, which is what lines several decays up when their peaks sit
+# at different arrival times -- on an absolute axis they read as offset rather
+# than overlaid.
+_X_AXIS_CHOICES = ("absolute", "relative")
+
+_X_AXIS_LABEL = {
+    "absolute": "Arrival time within laser cycle (ns)",
+    "relative": "Time since fit start (ns)",
+}
+
+
+def resolve_x_axis(value, default: str = "absolute") -> str:
+    """Validate a time-axis mode; None or blank gives *default*.
+
+    Raises ValueError on anything else, so a typo in a call argument is a
+    loud error rather than a silently absolute plot.  Callers reading the
+    mode out of a FILE (where a junk value must not block reopening) catch
+    that and fall back themselves.
+    """
+    v = str(value).strip().lower() if value is not None else ""
+    if not v:
+        return default
+    if v not in _X_AXIS_CHOICES:
+        raise ValueError("x_axis must be one of %s; got %r."
+                         % (" / ".join(_X_AXIS_CHOICES), value))
+    return v
+
+
 def plot_lifetime_fit(
     result: dict,
     source_name: str,
     show: bool = True,
+    x_axis: Optional[str] = None,
 ) -> Tuple[plt.Figure, np.ndarray]:
-    """Plot the decay (log-y), the fitted curve, and the residuals."""
-    model = result["model"]
-    t_ns  = result["t_ns"]
-    t_rel = result["t_rel"]
+    """Plot the decay (log-y), the fitted curve, and the residuals.
+
+    Time axis
+    ---------
+    *x_axis* is "absolute" or "relative" (see _X_AXIS_CHOICES).  The explicit
+    argument wins, then ``result["x_axis"]``, then absolute -- so a caller
+    that passes nothing and a result that records nothing behave exactly as
+    this function always has.
+
+    Rebuilt fits
+    ------------
+    A fit reopened from its exported curve CSV has no model object and no
+    fitted values: the CSV records the CURVE, not the parameters.  Such a
+    result plots the exported ``fit`` column at the measured points instead
+    of a 600-point curve evaluated from the model, and carries no parameter
+    box -- there is nothing to put in one.  Everything else, the log-y axis,
+    the residual strip and the data/fit Normalize pairing included, is
+    identical, so reopening still goes through this one rendering path
+    rather than a second that could drift away from it.
+    """
+    model  = result.get("model")
+    names  = result.get("names") or []
+    values = result.get("values") or {}
+    have_params = model is not None and bool(names) and bool(values)
+
+    mode = resolve_x_axis(x_axis if x_axis is not None
+                          else result.get("x_axis"))
+    t_ns  = np.asarray(result["t_ns"], dtype=float)
+    t_rel = np.asarray(result["t_rel"], dtype=float)
+    x       = t_rel if mode == "relative" else t_ns
+    x_shift = 0.0 if mode == "relative" else float(t_ns[0])
 
     fig, (ax, axr) = plt.subplots(
         2, 1, sharex=True, figsize=(9, 5.5),
@@ -739,71 +797,87 @@ def plot_lifetime_fit(
         layout="constrained",
     )
 
-    # Data + smooth fit curve (log-y)
-    ln_data, = ax.semilogy(t_ns, np.maximum(result["counts"], 0.1),
+    # Data + fit curve (log-y)
+    ln_data, = ax.semilogy(x, np.maximum(result["counts"], 0.1),
                            linestyle="none", marker=".", markersize=3,
                            color="black", label="data")
-    t_dense_rel = np.linspace(t_rel.min(), t_rel.max(), 600)
-    y_dense = model.func(t_dense_rel, **{n: result["values"][n] for n in result["names"]})
-    ln_fit, = ax.semilogy(t_dense_rel + t_ns[0], np.maximum(y_dense, 0.1),
-                          color="tomato", linewidth=1.6, label="fit")
+    if have_params:
+        t_dense_rel = np.linspace(t_rel.min(), t_rel.max(), 600)
+        y_dense = model.func(t_dense_rel, **{n: values[n] for n in names})
+        ln_fit, = ax.semilogy(t_dense_rel + x_shift, np.maximum(y_dense, 0.1),
+                              color="tomato", linewidth=1.6, label="fit")
+    else:
+        # Nothing to evaluate: the exported fit column IS the fitted curve,
+        # sampled at the measured points rather than smoothly interpolated.
+        ln_fit, = ax.semilogy(x, np.maximum(result["fit"], 0.1),
+                              color="tomato", linewidth=1.6, label="fit")
     # Pairing for the plot-tools Normalize toggle: data scale by the fit's
     # leading-point reference, never separately from their fit.
     ln_data._norm_ref = ln_fit
     ax.set_ylabel("Photon counts", fontsize=12)
 
-    # Parameter summary box
-    lines = []
-    for n in result["names"]:
-        val = result["values"][n]
-        err = result["errors"][n]
-        unit = next((p.unit for p in model.params if p.name == n), "")
-        tag = "  (fixed)" if result["fixed"].get(n) else f" ± {err:.3g}"
-        lines.append(f"{n} = {val:.4g}{tag} {unit}".rstrip())
-    # Normalised component fractions, one compact row per component:
-    #   α = amplitude fraction (fraction of MOLECULES)
-    #   f = intensity fraction (fraction of PHOTONS)
-    # Both on one line so a triple exponential adds three rows, not six.
-    fr = result.get("fractions")
-    if fr:
-        lines.append("")
-        lines.append("α = amplitude, f = intensity")
-        for i in fr["indices"]:
-            lines.append(f"  {i}: α = {fr['alpha'][i]:.3f}   f = {fr['f'][i]:.3f}")
-    if np.isfinite(result.get("tau_mean", float("nan"))):
-        lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns  (ampl.)")
-    if fr:
-        lines.append(f"⟨τ⟩ = {fr['tau_mean_int']:.4g} ns  (int.)")
-    gof = (f"red. χ² = {result['red_chi2']:.3g}"
-           if result["weighted"] else f"R² = {result['r2']:.4f}")
-    lines.append(gof)
-    ax.text(0.98, 0.95, "\n".join(lines), transform=ax.transAxes,
-            ha="right", va="top", fontsize=9, family="monospace",
-            bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+    # Parameter summary box.  Omitted entirely for a rebuilt fit: an empty
+    # box, or one reporting only what the curve file happens to hold, would
+    # look like the fit had no parameters rather than like they were not
+    # recorded.
+    if have_params:
+        lines = []
+        for n in names:
+            val = values[n]
+            err = result["errors"][n]
+            unit = next((p.unit for p in model.params if p.name == n), "")
+            tag = "  (fixed)" if result["fixed"].get(n) else f" ± {err:.3g}"
+            lines.append(f"{n} = {val:.4g}{tag} {unit}".rstrip())
+        # Normalised component fractions, one compact row per component:
+        #   α = amplitude fraction (fraction of MOLECULES)
+        #   f = intensity fraction (fraction of PHOTONS)
+        # Both on one line so a triple exponential adds three rows, not six.
+        fr = result.get("fractions")
+        if fr:
+            lines.append("")
+            lines.append("α = amplitude, f = intensity")
+            for i in fr["indices"]:
+                lines.append(f"  {i}: α = {fr['alpha'][i]:.3f}   f = {fr['f'][i]:.3f}")
+        if np.isfinite(result.get("tau_mean", float("nan"))):
+            lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns  (ampl.)")
+        if fr:
+            lines.append(f"⟨τ⟩ = {fr['tau_mean_int']:.4g} ns  (int.)")
+        gof = (f"red. χ² = {result['red_chi2']:.3g}"
+               if result["weighted"] else f"R² = {result['r2']:.4f}")
+        lines.append(gof)
+        ax.text(0.98, 0.95, "\n".join(lines), transform=ax.transAxes,
+                ha="right", va="top", fontsize=9, family="monospace",
+                bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
 
     ax.legend(loc="lower left", fontsize=10, framealpha=0.85)
     ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
 
     ch = result.get("channel")
-    ch_str = f"Ch{ch}  ·  " if ch else ""
-    title = f"Lifetime fit — {model.name}"
-    subtitle = (f"{source_name}  ·  {ch_str}{result['n_points']} points  ·  "
-                f"window {result['fit_start_ns']:.2f}–{result['fit_end_ns']:.2f} ns"
-                f"  ·  {model.formula}")
-    ax.set_title(f"{title}\n{subtitle}", fontsize=10)
+    model_label = (model.name if model is not None
+                   else (result.get("model_key") or "model not recorded"))
+    bits = [source_name]
+    if ch:
+        bits.append(f"Ch{ch}")
+    bits.append(f"{result['n_points']} points")
+    bits.append(f"window {result['fit_start_ns']:.2f}–"
+                f"{result['fit_end_ns']:.2f} ns")
+    if model is not None:
+        bits.append(model.formula)
+    ax.set_title(f"Lifetime fit — {model_label}\n" + "  ·  ".join(bits),
+                 fontsize=10)
 
     # Residuals (weighted residuals if a Poisson σ was used)
-    res = result["resid"]
+    res = np.asarray(result["resid"], dtype=float)
     if result["weighted"]:
-        res = res / result["sigma"]
+        res = res / np.asarray(result["sigma"], dtype=float)
         axr.set_ylabel("resid/σ", fontsize=10)
     else:
         axr.set_ylabel("resid", fontsize=10)
-    axr.plot(t_ns, res, linestyle="none", marker=".",
+    axr.plot(x, res, linestyle="none", marker=".",
              markersize=3, color="steelblue")
     axr.axhline(0, color="grey", linewidth=0.8)
-    axr.set_xlabel("Arrival time within laser cycle (ns)", fontsize=12)
+    axr.set_xlabel(_X_AXIS_LABEL[mode], fontsize=12)
     axr.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
     axr.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:.2g}"))
 
@@ -811,6 +885,129 @@ def plot_lifetime_fit(
         fcs_plottools.show_figure(fig, np.array([ax, axr]))
     return fig, np.array([ax, axr])
 
+
+# ── Reopening an exported fit curve ───────────────────────────────────────────
+
+# Columns that identify a RECONVOLUTION fit curve.  fcs_lifetime_recon writes
+# its curves under the same "# Lifetime fit curve — <key>" banner as this
+# module, so the header cannot tell the two apart and the columns must.
+_RECON_COLUMNS = ("time_ns", "decay", "irf")
+
+
+def _rebuild_notes(name: str, counts, mode: str,
+                   recorded_mode: Optional[str]) -> list:
+    """Caveats about one rebuilt curve, for fcs_plotopen's overlay notes.
+
+    The one worth raising is a fit window that did not start at the decay
+    peak.  The plot-tools Normalize control divides a trace by its own
+    leading points, so such a curve is set to 1 at a point on the rise or
+    the tail -- and overlaid against a curve that DOES start at its peak,
+    the two are silently being equated at different physical points.  The
+    arithmetic is fine either way; the comparison is not.
+    """
+    notes: list = []
+    c = np.asarray(counts, dtype=float)
+    if c.size and np.isfinite(c).any():
+        peak = int(np.nanargmax(c))
+        if peak != 0:
+            notes.append(
+                "%s: the fit window does not start at the decay peak — the "
+                "maximum is %d point(s) in.  Normalize divides each trace by "
+                "its own first points, so this curve would be set to 1 on its "
+                "rise or tail rather than at its peak, which is not a like-"
+                "for-like comparison against one that does start at its peak."
+                % (name, peak))
+    if recorded_mode and recorded_mode != mode:
+        notes.append("%s: drawn on the %s time axis, overriding the %s axis "
+                     "recorded in the file." % (name, mode, recorded_mode))
+    return notes
+
+
+def rebuild_plot(meta, columns, show: bool = True, path=None, options=None):
+    """
+    Redraw an exported lifetime TAIL fit curve as a live figure, for
+    :mod:`fcs_plotopen`.
+
+    Calls the same :func:`plot_lifetime_fit` that drew the file originally,
+    with a result dict assembled from the exported columns, so there is no
+    second rendering path.  The CSV holds the curve and not the fitted
+    parameters, so the figure plots the exported ``fit`` column and carries
+    no parameter box; see that function for the rest of what that implies.
+
+    ``options`` may carry ``{"x_axis": "absolute" | "relative"}``, which
+    overrides the mode recorded in the file.  It exists because the reopen
+    path has no setup dialog of its own: without it, a curve exported on an
+    absolute axis could never be overlaid on a relative one without
+    refitting it.
+
+    Sets ``fig._fcs_rebuild_notes`` to a list of caveats about this
+    particular file, which fcs_plotopen folds into the notes it reports for
+    an overlay.
+    """
+    if "t_ns" not in columns or "fit" not in columns:
+        if all(c in columns for c in _RECON_COLUMNS):
+            raise ValueError(
+                "This is a RECONVOLUTION fit curve, written by the "
+                "reconvolution fitter.  It carries the same header banner as "
+                "a tail fit but different columns, and reopening it is not "
+                "supported yet.")
+        raise ValueError(
+            "This file has no 't_ns' and 'fit' columns, so it is not a "
+            "lifetime tail-fit curve export.")
+    if "counts" not in columns:
+        raise ValueError(
+            "This lifetime fit curve has no 'counts' column, so the measured "
+            "decay it was fitted to cannot be drawn.")
+
+    t_ns = np.asarray(columns["t_ns"], dtype=float)
+    if t_ns.size < 2:
+        raise ValueError("This lifetime fit curve has fewer than two points.")
+    counts = np.asarray(columns["counts"], dtype=float)
+    fit    = np.asarray(columns["fit"], dtype=float)
+    # t_rel_ns has been written since the first version of this export, but
+    # it is exactly t_ns - t_ns[0], so a file lacking it loses nothing.
+    t_rel = (np.asarray(columns["t_rel_ns"], dtype=float)
+             if "t_rel_ns" in columns else t_ns - t_ns[0])
+    resid = (np.asarray(columns["residual"], dtype=float)
+             if "residual" in columns else counts - fit)
+    sigma = (np.asarray(columns["sigma"], dtype=float)
+             if "sigma" in columns else None)
+    # A sigma column is written only by a weighted fit, so its presence IS
+    # the record of how the fit was weighted.
+    weighted = sigma is not None and bool(np.isfinite(sigma).any())
+
+    ch_txt = str(meta.get("channel", "")).strip()
+    channel = (int(ch_txt[2:]) if ch_txt[:2].lower() == "ch"
+               and ch_txt[2:].isdigit() else None)
+
+    # A junk x_axis value in the header must not stop the file reopening.
+    try:
+        recorded_mode = (resolve_x_axis(meta.get("x_axis"))
+                         if str(meta.get("x_axis", "")).strip() else None)
+    except ValueError:
+        recorded_mode = None
+    override = (options or {}).get("x_axis")
+    mode = resolve_x_axis(override) if override else (recorded_mode
+                                                      or "absolute")
+
+    source_name = (str(meta.get("source", "")).strip()
+                   or (Path(path).name if path else "lifetime fit curve"))
+
+    result = {
+        "t_ns": t_ns, "t_rel": t_rel, "counts": counts, "fit": fit,
+        "resid": resid, "sigma": sigma, "weighted": weighted,
+        "channel": channel, "n_points": int(t_ns.size),
+        "fit_start_ns": float(t_ns[0]), "fit_end_ns": float(t_ns[-1]),
+        "model_key": meta.get("model_key"), "x_axis": mode,
+    }
+
+    fig, axes = plot_lifetime_fit(result, source_name, show=False,
+                                  x_axis=mode)
+    fig._fcs_rebuild_notes = _rebuild_notes(
+        Path(path).name if path else source_name, counts, mode, recorded_mode)
+    if show:
+        fcs_plottools.show_figure(fig, axes)
+    return fig, axes
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
@@ -940,9 +1137,17 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     names = list(cols.keys())
     with curve_path.open("w", encoding="utf-8-sig", newline="") as fh:
         fh.write(f"# Lifetime fit curve — {model.key}\n")
+        # The banner above is for a human reading the file; this key is the
+        # machine-readable one fcs_plotopen dispatches on.  read_export also
+        # recognises the banner, so curves written before this line existed
+        # still reopen -- but a key beats sniffing a dash-separated title.
+        fh.write("# analysis : lifetime fit curve\n")
         fh.write(f"# source : {source_path.name}\n")
         if ch is not None:
             fh.write(f"# channel : Ch{ch}\n")
+        # Which time axis the figure was drawn on, so reopening reproduces it.
+        # The reopen dialog can override this; it is a record, not a lock.
+        fh.write(f"# x_axis : {resolve_x_axis(result.get('x_axis'))}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(names) + "\n")
         # Cells go through fcs_export.csv_value, the renderer the shared
@@ -2780,6 +2985,25 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
         variable=weight_var, anchor="w",
     ).pack(fill="x", padx=12, pady=(6, 0))
 
+    # Time axis of the figure.  Recorded in the curve CSV so that reopening
+    # reproduces what was drawn, and overridable from the reopen dialog --
+    # overlaying decays whose peaks sit at different arrival times only lines
+    # them up on the relative axis.
+    x_axis_frame = tk.LabelFrame(win, text="Time axis", padx=10, pady=4)
+    x_axis_frame.pack(fill="x", padx=12, pady=(8, 0))
+    x_axis_var = tk.StringVar(value="absolute")
+    tk.Radiobutton(x_axis_frame, variable=x_axis_var, value="absolute",
+                   anchor="w", text="Arrival time within the laser cycle"
+                   ).pack(fill="x")
+    tk.Radiobutton(x_axis_frame, variable=x_axis_var, value="relative",
+                   anchor="w", text="Time since the start of the fit window"
+                   ).pack(fill="x")
+    tk.Label(x_axis_frame,
+             text="      Relative is what lines several decays up when their "
+                  "peaks sit at\n      different arrival times.",
+             font=("Helvetica", 8), fg="grey", anchor="w",
+             justify="left").pack(fill="x")
+
     # Optional label folded into the fit folder and the output filenames, so a
     # set of fits can be told apart in a file listing (and in Excel's window
     # list) without opening them.  Same control, wording and behaviour as the
@@ -2838,9 +3062,13 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
         # Read the label BEFORE destroying the window: the StringVar outlives
         # the widget, but reading it first keeps the dependency obvious.
         fit_label = name_var.get()
+        x_axis_choice = x_axis_var.get()
         win.destroy()
 
         result["origin"] = getattr(fcs_data, "source_name", None)
+        # Set before the export: the curve CSV records this, so the figure
+        # that reopens is the figure that was drawn.
+        result["x_axis"] = x_axis_choice
 
         report_path, _curve, _params = export_lifetime_fit(
             result, fcs_data.filepath, fit_label)

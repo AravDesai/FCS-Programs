@@ -491,6 +491,104 @@ def plot_matrix_curve(fit, show=True):
     return fig, axes
 
 
+def plot_matrix_curve_overlay(fits, show=True):
+    """Several datasets' curves and matrix fits on ONE axes, over a shared
+    residual strip.
+
+    One colour per dataset: the measured G as faint markers, A·d as a solid
+    line of the same colour.  Per-point error bars are not drawn -- N overlaid
+    sets of them hide the curves they belong to, the same call
+    fcs_corr.plot_correlation_overlay makes about its ±1 SEM band.  The
+    weighting still governs the solve and the residuals; it is simply not
+    drawn here.
+
+    The residual strip holds every dataset.  WEIGHTED residuals are in units
+    of sigma and are directly comparable across datasets; UNWEIGHTED ones
+    carry the units of G, so a dataset with a ten-fold larger G0 dominates the
+    strip and the others read as flat.  The y label says which is on show.
+
+    Each data line is tagged with its own fit line through ``_norm_ref``, the
+    fcs_plottools contract, so the Normalize control scales a dataset by its
+    fit's leading points rather than by its own noisy ones -- which is what
+    makes an overlay of curves with different G0 readable as shape.
+
+    The amplitude distributions have no overlaid form: each is a function of
+    its own dataset's amplitudes against a shared grid, and N filled step
+    regions on one axes occlude each other.  They stay one figure per dataset.
+
+    Returns (fig, axes) with axes = array([ax, axr]), matching
+    plot_matrix_curve, so show_figure gives both the same panel.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import ticker
+    from matplotlib.gridspec import GridSpec
+
+    fits = list(fits)
+    if not fits:
+        raise ValueError("plot_matrix_curve_overlay requires at least one fit.")
+
+    colours = fcs_plottools.palette(len(fits))
+
+    fig = plt.figure(figsize=(9.0, 6.0))
+    gs = GridSpec(2, 1, height_ratios=[3.0, 1.0], hspace=0.08, figure=fig)
+    ax = fig.add_subplot(gs[0])
+    axr = fig.add_subplot(gs[1], sharex=ax)
+
+    # Before the residual points, so the points sit on top of the line.
+    axr.axhline(0.0, color="grey", linewidth=0.8, label="_zero")
+
+    for f, c in zip(fits, colours):
+        tau_ms = f["tau"] * 1e3
+        # Data hidden from the legend, fit visible: one entry per dataset, and
+        # the solid line is the more legible swatch.  Both keep a name, so the
+        # plot-controls trace selector lists them individually.
+        ln_data, = ax.plot(tau_ms, f["G"], linestyle="none", marker="o",
+                           ms=2.5, color=c, alpha=0.45,
+                           label="_%s  (data)" % f["name"], zorder=2)
+        ln_fit, = ax.plot(tau_ms, f["G_fit"], "-", lw=1.6, color=c,
+                          label="%s  (χ²/dof %.3g)"
+                                % (f["name"], f["chi2_red"]), zorder=3)
+        ln_data._norm_ref = ln_fit
+
+        res = f["residual_weighted"] if f["weighted"] else f["residual"]
+        axr.plot(tau_ms, res, linestyle="none", marker=".", ms=2.5,
+                 color=c, alpha=0.8, label="_%s  (residual)" % f["name"])
+
+    ax.set_xscale("log")
+    ax.set_ylabel("G(τ)", fontsize=12)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    fcs_plottools.adaptive_legend(ax, base_fontsize=9, loc="upper right")
+    plt.setp(ax.get_xticklabels(), visible=False)
+
+    # One run shares a basis, but the function is public and may be handed
+    # fits from two; say so rather than quoting the first one's count.
+    n_basis = {int(f["n_basis"]) for f in fits}
+    basis_txt = ("%d basis vectors" % n_basis.pop() if len(n_basis) == 1
+                 else "mixed bases")
+    chi = [float(f["chi2_red"]) for f in fits]
+    dws = [float(f.get("durbin_watson", float("nan"))) for f in fits]
+    dws = [v for v in dws if np.isfinite(v)]
+    dw_txt = ("  ·  DW %.3f to %.3f" % (min(dws), max(dws))) if dws else ""
+    ax.set_title("Matrix method — %d dataset%s overlaid\n"
+                 "%s  ·  χ²/dof %.4g to %.4g%s"
+                 % (len(fits), "" if len(fits) == 1 else "s", basis_txt,
+                    min(chi), max(chi), dw_txt), fontsize=10)
+
+    axr.set_xscale("log")
+    axr.set_xlabel("Lag time τ (ms)", fontsize=12)
+    weighted = {bool(f["weighted"]) for f in fits}
+    axr.set_ylabel("resid/σ" if weighted == {True}
+                   else ("resid" if weighted == {False} else "resid (MIXED)"),
+                   fontsize=10)
+    axr.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    axr.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:.2g}"))
+
+    axes = np.array([ax, axr])
+    if show:
+        fcs_plottools.show_figure(fig, axes)
+    return fig, axes
+
+
 def _fmt_bound_inward(value, round_up, digits=6):
     """Format a bound so the displayed number stays INSIDE the true one.
 
@@ -1099,6 +1197,28 @@ def _setup_dialog(parent, datasets):
              font=("Helvetica", 8), fg="grey", anchor="w",
              justify="left").pack(fill="x")
 
+    # Curve windows.  The amplitude distribution is drawn per dataset in every
+    # case -- it has no overlaid form -- so this governs the curve figure only.
+    # With one dataset there is nothing to overlay, so the choice is pinned
+    # rather than offered and silently ignored.
+    multi = len(datasets) > 1
+    plot_f = tk.LabelFrame(body, text="Plots", padx=10, pady=6)
+    plot_f.pack(fill="x", padx=12, pady=4)
+    plots_var = tk.StringVar(master=win, value="separate")
+    for _value, _text in (
+            ("separate", "One curve window per dataset"),
+            ("overlay", "All curves on one overlaid window"),
+            ("both", "Both — the overlay and the per-dataset windows")):
+        tk.Radiobutton(plot_f, variable=plots_var, value=_value, anchor="w",
+                       state=("normal" if multi else "disabled"),
+                       text=_text).pack(fill="x")
+    tk.Label(plot_f,
+             text=("      The amplitude distribution is drawn per dataset "
+                   "either way." if multi else
+                   "      One dataset selected — nothing to overlay."),
+             font=("Helvetica", 8), fg="grey", anchor="w",
+             justify="left", wraplength=430).pack(fill="x")
+
     name_f = tk.Frame(body)
     name_f.pack(fill="x", padx=12, pady=(4, 2))
     tk.Label(name_f, text="Label (optional):", anchor="w",
@@ -1162,9 +1282,18 @@ def _setup_dialog(parent, datasets):
 
         win.destroy()
 
+        # The distribution is per dataset whatever the mode; only the curve
+        # window is replaced by the overlay.  plots_var is pinned to
+        # "separate" for a single dataset, so the guard is belt and braces.
+        mode = plots_var.get() if len(fits) > 1 else "separate"
+
         for f in fits:
-            # Two windows per dataset: curve+residuals, and the distribution.
-            plot_matrix_fit(f, show=True)
+            if mode != "overlay":
+                plot_matrix_curve(f, show=True)
+            plot_matrix_distribution(f, show=True)
+
+        if mode in ("overlay", "both"):
+            plot_matrix_curve_overlay(fits, show=True)
 
         if export_var.get():
             chk = span_check(grid, lag_lo, lag_hi, _basis_key())

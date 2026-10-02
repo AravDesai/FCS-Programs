@@ -264,6 +264,15 @@ def read_export(path) -> Tuple[dict, dict]:
                     elif banner == "fcs global fit curves":
                         meta.setdefault("analysis", "global fit curves")
                         meta.setdefault("model_key", tail)
+                    elif banner == "lifetime fit curve":
+                        # The lifetime fitters write their curve CSVs
+                        # directly rather than through export_columns, so
+                        # this banner is all that identifies the older ones.
+                        # Both the tail fitter and the reconvolution fitter
+                        # use it, with different COLUMNS; the rebuilder
+                        # tells them apart, because the header cannot.
+                        meta.setdefault("analysis", "lifetime fit curve")
+                        meta.setdefault("model_key", tail)
                 continue
             if header is None:
                 header = [c.strip() for c in raw]

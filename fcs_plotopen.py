@@ -59,6 +59,7 @@ Public API
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -74,6 +75,7 @@ _REBUILDERS: dict = {
     "global fit curves":  ("fcs_fit",      "rebuild_plot"),
     "calibration points": ("fcs_calib",    "rebuild_plot"),
     "lifetime":           ("fcs_lifetime", "rebuild_plot"),
+    "lifetime fit curve": ("fcs_lifetime_fit", "rebuild_plot"),
     "pch":                ("fcs_pch",      "rebuild_plot"),
     "intensity":          ("fcs_plot",     "rebuild_plot"),
 }
@@ -123,7 +125,29 @@ def _resolve(analysis: str):
     return fn
 
 
-def open_export(path, show: bool = True) -> Tuple:
+def _call_rebuilder(fn, meta, columns, show, path, options):
+    """
+    Call a rebuilder, forwarding *options* only to those that accept it.
+
+    ``options`` is an optional extension to the rebuilder contract: display
+    choices the reopen path collected from the user, which only some
+    analyses have any use for (the lifetime fit curve's time axis is the
+    first).  Rebuilders written before it existed take four arguments and
+    must keep working untouched, so the parameter is passed only when the
+    target's signature actually has it.
+    """
+    kw = {"show": show, "path": path}
+    if options:
+        try:
+            accepts = "options" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):   # builtins, C functions, exotic wrappers
+            accepts = False
+        if accepts:
+            kw["options"] = options
+    return fn(meta, columns, **kw)
+
+
+def open_export(path, show: bool = True, options=None) -> Tuple:
     """
     Reopen an exported analysis CSV as a live figure.
 
@@ -133,6 +157,9 @@ def open_export(path, show: bool = True) -> Tuple:
         A CSV written by this suite.
     show : bool
         Display the figure and its plot-controls panel.
+    options : dict, optional
+        Display choices forwarded to the rebuilder if it accepts them; see
+        :func:`_call_rebuilder`.
 
     Returns
     -------
@@ -162,7 +189,8 @@ def open_export(path, show: bool = True) -> Tuple:
     if not columns:
         raise ValueError(f"{p.name} contains a header but no data rows.")
 
-    return _resolve(analysis)(meta, columns, show=show, path=p)
+    return _call_rebuilder(_resolve(analysis), meta, columns, show, p,
+                           options)
 
 
 # ── Overlaying several exports ────────────────────────────────────────────────
@@ -211,6 +239,28 @@ def _main_axes(fig, axes):
     return seq[0] if seq else None
 
 
+def _axis_labels(fig, main_ax):
+    """
+    The x and y labels that describe *main_ax*'s data.
+
+    In a stacked fit figure the x axis is SHARED and only the bottom panel
+    carries its label, so reading the x label off the main panel alone
+    returns "" -- the overlay then has an unlabelled x axis, and the
+    disagreement check in open_exports can never fire because every
+    two-panel figure reports the same empty string.  Falling back to the
+    lowest panel that has one fixes both, and changes nothing for a
+    single-panel figure, which labels its own axis.
+    """
+    xlabel = main_ax.get_xlabel()
+    if not xlabel:
+        for other in reversed(fig.axes):
+            lbl = other.get_xlabel()
+            if lbl:
+                xlabel = lbl
+                break
+    return xlabel, main_ax.get_ylabel()
+
+
 def _qualified_label(label, stem: str) -> str:
     """
     Prefix a trace's label with the file it came from.
@@ -233,7 +283,7 @@ def _qualified_label(label, stem: str) -> str:
     return f"{stem} — {lbl}"
 
 
-def open_exports(paths, show: bool = True) -> Tuple:
+def open_exports(paths, show: bool = True, options=None) -> Tuple:
     """
     Reopen several exported analyses overlaid on a single figure.
 
@@ -303,7 +353,7 @@ def open_exports(paths, show: bool = True) -> Tuple:
 
     for p in items:
         try:
-            src_fig, src_axes = open_export(p, show=False)
+            src_fig, src_axes = open_export(p, show=False, options=options)
         except Exception as exc:            # noqa: BLE001 — collected below
             notes.append(f"{p.name}: skipped — {exc}")
             continue
@@ -314,18 +364,26 @@ def open_exports(paths, show: bool = True) -> Tuple:
                 notes.append(f"{p.name}: skipped — rebuilt figure has no axes.")
                 continue
 
+            # Caveats the rebuilder itself raised about this file.  Part of
+            # the rebuilder contract rather than a special case here: this
+            # module knows nothing about any analysis, and a lifetime fit
+            # that did not start at its peak is exactly the sort of thing
+            # only the owning module can notice.
+            for _note in getattr(src_fig, "_fcs_rebuild_notes", None) or []:
+                notes.append(str(_note))
+
+            src_xlabel, src_ylabel = _axis_labels(src_fig, src_ax)
             if first_axes_style is None:
                 first_axes_style = (
                     src_ax.get_xscale(), src_ax.get_yscale(),
-                    src_ax.get_xlabel(), src_ax.get_ylabel(),
+                    src_xlabel, src_ylabel,
                 )
             else:
-                if (src_ax.get_xlabel(), src_ax.get_ylabel()) != \
-                        first_axes_style[2:]:
+                if (src_xlabel, src_ylabel) != first_axes_style[2:]:
                     notes.append(
                         f"{p.name}: axis labels differ from the first file "
-                        f"(\"{src_ax.get_xlabel()}\" / "
-                        f"\"{src_ax.get_ylabel()}\" vs "
+                        f"(\"{src_xlabel}\" / "
+                        f"\"{src_ylabel}\" vs "
                         f"\"{first_axes_style[2]}\" / "
                         f"\"{first_axes_style[3]}\") — overlaid anyway, so "
                         f"read the axes with that in mind."
@@ -422,6 +480,107 @@ def open_exports(paths, show: bool = True) -> Tuple:
     return fig, ax, notes
 
 
+def _peek_lifetime_x_axis(path) -> Optional[str]:
+    """
+    If *path* is a lifetime fit curve, the time axis recorded in it.
+
+    Returns the recorded mode, or "" for a lifetime fit curve that records
+    none, or None for anything else.
+
+    Deliberately cheap and best-effort: it reads comment lines only and
+    stops at the column header, because read_export parses the whole file
+    and an intensity export can be a hundred thousand rows.  Its only
+    consequence is whether the time-axis dialog appears, so a false
+    negative costs a dialog and never a wrong plot -- the rebuilder reads
+    the real header through read_export either way.
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8-sig") as fh:
+            is_lifetime_fit = False
+            recorded = ""
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                if not line.startswith("#"):
+                    break
+                body = line[1:].strip()
+                if ":" in body:
+                    key, val = body.split(":", 1)
+                    key = key.strip().lower()
+                    if key == "analysis" and val.strip().lower() == \
+                            "lifetime fit curve":
+                        is_lifetime_fit = True
+                    elif key == "x_axis":
+                        recorded = val.strip().lower()
+                elif "—" in body:
+                    if body.split("—", 1)[0].strip().lower() == \
+                            "lifetime fit curve":
+                        is_lifetime_fit = True
+            return recorded if is_lifetime_fit else None
+    except OSError:
+        return None
+
+
+def _ask_lifetime_x_axis(parent, n_files: int, n_total: int,
+                         preselect: str) -> Optional[str]:
+    """
+    Ask which time axis to draw reopened lifetime fit curves on.
+
+    The reopen path has no setup dialog, so without this a curve exported on
+    an absolute axis could only ever be reopened on one -- and overlaying
+    decays whose peaks sit at different arrival times needs the relative
+    axis to line them up at all.
+
+    Returns "absolute", "relative", or None if cancelled.
+    """
+    import tkinter as tk
+
+    win = tk.Toplevel(parent)
+    win.title("Lifetime fit curves — time axis")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text="Time axis", font=("Helvetica", 12, "bold"),
+             pady=6).pack()
+    scope = (f"{n_files} of the {n_total} selected files are lifetime fit "
+             f"curves." if n_files != n_total else
+             ("This file is a lifetime fit curve." if n_total == 1 else
+              f"All {n_total} selected files are lifetime fit curves."))
+    tk.Label(win, text=scope, font=("Helvetica", 9), fg="grey").pack(padx=14)
+
+    var = tk.StringVar(master=win, value=preselect)
+    frame = tk.Frame(win, padx=16, pady=8)
+    frame.pack(fill="x")
+    tk.Radiobutton(frame, variable=var, value="absolute", anchor="w",
+                   text="Arrival time within the laser cycle").pack(fill="x")
+    tk.Radiobutton(frame, variable=var, value="relative", anchor="w",
+                   text="Time since the start of the fit window").pack(fill="x")
+    tk.Label(win,
+             text=("      Relative lines several decays up when their peaks "
+                   "sit at different\n      arrival times; on the absolute "
+                   "axis they read as offset.\n"
+                   "      Preselected from what the first file recorded."),
+             font=("Helvetica", 8), fg="grey", anchor="w",
+             justify="left").pack(fill="x", padx=4)
+
+    choice = {"val": None}
+
+    def _ok():
+        choice["val"] = var.get()
+        win.destroy()
+
+    btns = tk.Frame(win)
+    btns.pack(pady=10)
+    tk.Button(btns, text="Open", width=10, command=_ok, pady=4
+              ).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4
+              ).pack(side="left", padx=6)
+
+    win.wait_window()
+    return choice["val"]
+
+
 def run_open_dialog(parent=None, initialdir=None) -> Optional[Tuple]:
     """
     Ask for one or more exported CSVs and reopen them.
@@ -449,11 +608,26 @@ def run_open_dialog(parent=None, initialdir=None) -> Optional[Tuple]:
         return None
     paths = list(paths)
 
+    # Lifetime fit curves are the one analysis with a display choice the
+    # reopen path has to make, because the figure's time axis is fixed at
+    # fit time and overlaying decays with different peak positions needs
+    # the other one.
+    options = None
+    peeked = [_peek_lifetime_x_axis(p) for p in paths]
+    n_lifetime = sum(1 for v in peeked if v is not None)
+    if n_lifetime:
+        preselect = next((v for v in peeked if v), "") or "absolute"
+        choice = _ask_lifetime_x_axis(parent, n_lifetime, len(paths),
+                                      preselect)
+        if choice is None:
+            return None
+        options = {"x_axis": choice}
+
     try:
         if len(paths) == 1:
-            return open_export(paths[0], show=True)
+            return open_export(paths[0], show=True, options=options)
 
-        fig, ax, notes = open_exports(paths, show=True)
+        fig, ax, notes = open_exports(paths, show=True, options=options)
         if notes:
             # Reported after the figure is up, so the overlay is on screen
             # to look at while reading what did not make it across.
